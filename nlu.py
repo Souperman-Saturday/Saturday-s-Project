@@ -1,225 +1,270 @@
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from dateutil import parser as dtparser
 
-TZ = ZoneInfo("Asia/Taipei")
 
-CN_NUM = {
-    "零":0, "一":1, "二":2, "兩":2, "三":3, "四":4, "五":5, "六":6, "七":7, "八":8, "九":9,
-    "十":10, "百":100
+# ---------- Intent ----------
+@dataclass
+class Intent:
+    name: str
+    args: dict
+
+
+# ---------- Chinese numeral ----------
+_CN_NUM = {
+    "零": 0, "〇": 0,
+    "一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10
 }
+
 
 def cn_to_int(s: str) -> int:
     s = s.strip()
     if not s:
         return 0
-    # 若是純阿拉伯數字
-    if re.fullmatch(r"\d+", s):
+    if s.isdigit():
         return int(s)
-    # 簡單中文數字（到 999 足夠用提醒）
-    total = 0
-    num = 0
-    unit = 1
-    if "百" in s:
-        parts = s.split("百")
-        total += CN_NUM.get(parts[0], 0) * 100
-        s = parts[1] if len(parts) > 1 else ""
+    # 10, 11, 12, 20, 21...
+    if s == "十":
+        return 10
     if "十" in s:
         parts = s.split("十")
         left = parts[0]
         right = parts[1] if len(parts) > 1 else ""
-        total += (CN_NUM.get(left, 1) if left != "" else 1) * 10
-        if right:
-            total += CN_NUM.get(right, 0)
-        return total
-    # 個位
-    for ch in s:
-        if ch in CN_NUM:
-            total = total * 10 + CN_NUM[ch]
-    return total
+        tens = _CN_NUM.get(left, 1) if left else 1
+        ones = _CN_NUM.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return _CN_NUM.get(s, 0)
 
-ZODIACS = ["牡羊座","金牛座","雙子座","巨蟹座","獅子座","處女座","天秤座","天蠍座","射手座","摩羯座","水瓶座","雙魚座"]
 
-def normalize(text: str) -> str:
-    t = (text or "").strip()
-    # 全形數字轉半形（簡化）
-    t = t.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
-    return t
+def _now(tz_name: str) -> datetime:
+    return datetime.now(ZoneInfo(tz_name))
 
-def parse_intent(text: str, profile: dict) -> dict:
-    t = normalize(text)
+
+# ---------- time parse ----------
+def parse_due_at(text: str, tz_name: str) -> str | None:
+    """
+    支援：
+    - 兩分鐘後/1分鐘後/半小時後/2小時後
+    - 2026-02-14 18:30
+    - 2/14 18:30（用今年）
+    - 明天 18:30 / 今天 18:30 / 今晚8點
+    """
+    t = text.strip()
+
+    now = _now(tz_name)
+
+    # 1) duration: X(秒/分鐘/小時/天)後
+    m = re.search(r"(?P<n>(\d+|[零〇一二兩三四五六七八九十]+|半))\s*(?P<u>秒|分鐘|分|小時|時|天)\s*後", t)
+    if m:
+        n_raw = m.group("n")
+        unit = m.group("u")
+        if n_raw == "半":
+            n = 0.5
+        else:
+            n = float(cn_to_int(n_raw)) if not n_raw.isdigit() else float(int(n_raw))
+
+        delta = timedelta()
+        if unit in ("秒",):
+            delta = timedelta(seconds=int(n))
+        elif unit in ("分鐘", "分"):
+            delta = timedelta(minutes=int(n))
+        elif unit in ("小時", "時"):
+            delta = timedelta(hours=float(n))
+        elif unit in ("天",):
+            delta = timedelta(days=float(n))
+        due = now + delta
+        return due.strftime("%Y-%m-%d %H:%M")
+
+    # 2) absolute: YYYY-MM-DD HH:MM
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})", t)
+    if m:
+        y, mo, d, hh, mm = map(int, m.groups())
+        due = datetime(y, mo, d, hh, mm, tzinfo=ZoneInfo(tz_name))
+        return due.strftime("%Y-%m-%d %H:%M")
+
+    # 3) absolute: M/D HH:MM
+    m = re.search(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", t)
+    if m:
+        mo, d, hh, mm = map(int, m.groups())
+        due = datetime(now.year, mo, d, hh, mm, tzinfo=ZoneInfo(tz_name))
+        return due.strftime("%Y-%m-%d %H:%M")
+
+    # 4) relative day + HH:MM
+    m = re.search(r"(今天|今日|明天|後天)\s*(\d{1,2}):(\d{2})", t)
+    if m:
+        day_word, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
+        base = now.date()
+        if day_word in ("明天",):
+            base = (now + timedelta(days=1)).date()
+        elif day_word in ("後天",):
+            base = (now + timedelta(days=2)).date()
+        due = datetime(base.year, base.month, base.day, hh, mm, tzinfo=ZoneInfo(tz_name))
+        return due.strftime("%Y-%m-%d %H:%M")
+
+    # 5) tonight 8點 / 明天8點
+    m = re.search(r"(今天|明天|後天|今晚)\s*(\d{1,2})\s*點", t)
+    if m:
+        day_word, hh = m.group(1), int(m.group(2))
+        base = now.date()
+        if day_word in ("明天",):
+            base = (now + timedelta(days=1)).date()
+        elif day_word in ("後天",):
+            base = (now + timedelta(days=2)).date()
+        due = datetime(base.year, base.month, base.day, hh, 0, tzinfo=ZoneInfo(tz_name))
+        return due.strftime("%Y-%m-%d %H:%M")
+
+    return None
+
+
+def detect_intent(text: str, tz_name: str) -> Intent:
+    t = text.strip()
 
     # help
-    if t.lower() in ["/help", "help", "指令", "指令表"]:
-        return {"type": "help"}
+    if t.lower() in ("/help", "help", "指令", "指令表"):
+        return Intent("HELP", {})
 
-    # 設定：城市
-    m = re.search(r"(?:設定城市|設定居住地|居住地|城市)\s*[:：]?\s*([^\s]+)", t)
+    # my id
+    if t in ("我的ID", "查詢我的ID", "我的 id", "my id", "myid"):
+        return Intent("MY_ID", {})
+
+    # bind/unbind/list
+    m = re.match(r"^綁定\s+(\S+)\s+(U[a-zA-Z0-9]{10,})$", t)
     if m:
-        return {"type": "set_city", "city": m.group(1).strip()}
+        return Intent("BIND", {"name": m.group(1), "user_id": m.group(2)})
 
-    # 自然句：我住在台中 -> 也當作 set_city（更像管家）
-    m = re.search(r"我住在\s*([^\s]+)", t)
+    m = re.match(r"^解除綁定\s+(\S+)$", t)
     if m:
-        return {"type": "set_city", "city": m.group(1).strip()}
+        return Intent("UNBIND", {"name": m.group(1)})
 
-    # 設定：星座
-    m = re.search(r"(?:設定星座|我的星座)\s*[:：]?\s*([^\s]+)", t)
+    if t in ("我的綁定", "查看綁定", "綁定清單"):
+        return Intent("LIST_BINDINGS", {})
+
+    # nickname
+    m = re.match(r"^我稱呼\s+(\S+)\s+為\s+(\S+)$", t)
     if m:
-        z = m.group(1).strip()
-        return {"type": "set_zodiac", "zodiac": z}
+        return Intent("SET_NICKNAME", {"target_name": m.group(1), "nickname": m.group(2)})
 
-    m = re.search(r"我(?:是|的星座是)\s*(.+?座)", t)
+    # settings
+    m = re.match(r"^設定城市\s+(.+)$", t)
     if m:
-        z = m.group(1).strip()
-        if any(z == x for x in ZODIACS):
-            return {"type": "set_zodiac", "zodiac": z}
+        return Intent("SET_CITY", {"city": m.group(1).strip()})
 
-    # 設定晨報時間 / 開關
-    m = re.search(r"(?:設定晨報時間|晨報時間)\s*[:：]?\s*(\d{1,2}:\d{2})", t)
+    m = re.match(r"^設定星座\s+(.+)$", t)
     if m:
-        return {"type": "set_morning_time", "hhmm": m.group(1)}
-    if re.search(r"(?:開啟晨報|打開晨報|晨報開啟)", t):
-        return {"type": "toggle_morning", "on": True}
-    if re.search(r"(?:關閉晨報|關掉晨報|晨報關閉)", t):
-        return {"type": "toggle_morning", "on": False}
+        return Intent("SET_ZODIAC", {"sign": m.group(1).strip()})
 
-    # 綁定 / 解除 / 名冊
-    m = re.search(r"(?:綁定)\s*([^\s]+)\s*(U[a-zA-Z0-9]+)", t)
+    m = re.match(r"^設定晨報時間\s+(\d{2}:\d{2})$", t)
     if m:
-        return {"type": "bind_alias", "alias": m.group(1).strip(), "user_id": m.group(2).strip()}
-    m = re.search(r"(?:解除綁定)\s*([^\s]+)", t)
+        return Intent("SET_MORNING_TIME", {"time": m.group(1)})
+
+    if t in ("開啟晨報", "晨報開啟"):
+        return Intent("MORNING_ON", {})
+
+    if t in ("關閉晨報", "晨報關閉"):
+        return Intent("MORNING_OFF", {})
+
+    # send message
+    m = re.match(r"^傳訊給\s*(\S+)\s+(.+)$", t)
     if m:
-        return {"type": "unbind_alias", "alias": m.group(1).strip()}
-    if re.search(r"(?:我的綁定|名冊|綁定清單)", t):
-        return {"type": "list_alias"}
+        return Intent("SEND_MESSAGE", {"target": m.group(1), "message": m.group(2).strip()})
 
-    # 我希望你叫我…（自我稱呼）
-    m = re.search(r"(?:叫我|稱呼我為|我叫)\s*([^\s]+)", t)
-    if m and len(m.group(1).strip()) <= 20:
-        return {"type": "set_my_name", "myname": m.group(1).strip()}
+    # reminders list/cancel
+    if t in ("我的提醒", "提醒清單", "看提醒"):
+        return Intent("LIST_REMINDERS", {})
 
-    # 你對某人的稱呼（每個人可以不同）
-    m = re.search(r"(?:我叫|我稱呼)\s*([^\s]+)\s*(?:叫|為)\s*([^\s]+)", t)
-    # 例：我叫 夫人 叫 寶貝
+    m = re.match(r"^取消提醒\s+([0-9a-fA-F-]{6,})$", t)
     if m:
-        return {"type": "set_callname", "target_alias": m.group(1).strip(), "callname": m.group(2).strip()}
+        return Intent("CANCEL_REMINDER", {"id": m.group(1)})
 
-    # 預設共享/私密
-    if re.search(r"(?:預設共享)", t):
-        return {"type": "set_prefs_default", "mode": "shared"}
-    if re.search(r"(?:預設私密)", t):
-        return {"type": "set_prefs_default", "mode": "private"}
-
-    # 看新聞 N
-    m = re.search(r"(?:看新聞)\s*(\d+)", t)
+    # remember explicit
+    m = re.match(r"^記住\s*\(共享\)\s*(.+)$", t)
     if m:
-        return {"type": "news_detail", "index": m.group(1)}
+        return Intent("REMEMBER", {"scope": "shared", "content": m.group(1).strip()})
 
-    # 日期/時間
-    if re.search(r"(今天日期|現在時間|幾點|幾號|今天幾號|今天幾月幾號|現在幾點)", t):
-        return {"type": "datetime"}
+    m = re.match(r"^記住\s+(.+)$", t)
+    if m:
+        return Intent("REMEMBER", {"scope": "private", "content": m.group(1).strip()})
 
-    # 天氣（自然：台中未來三天天氣 / 未來三天天氣 / 明天台中天氣 / 我下週去台北天氣如何）
-    if "天氣" in t or "氣溫" in t or "下雨" in t:
-        city = None
-        # 抓「X天氣」前面的 X
-        m = re.search(r"([^\s]{1,10})\s*(?:的)?(?:天氣|氣溫)", t)
-        if m:
-            cand = m.group(1).strip()
-            # 避免抓到「今天天氣」的「今天」
-            if cand not in ["今天","明天","後天","未來","下週","下周","這週","这周","未来","三天","3天"]:
-                city = cand
+    # share confirm
+    if t in ("共享", "家庭共享"):
+        return Intent("CONFIRM_SHARE", {"decision": "shared"})
+    if t in ("私密", "不共享"):
+        return Intent("CONFIRM_SHARE", {"decision": "private"})
 
-        # 3天/未來三天
-        if re.search(r"(未來三天|未来三天|3天|三天)", t):
-            # 特判：如果文字像「未來三天天氣」但 city 抓不到 -> 用設定城市
-            return {"type": "weather", "city": city, "days": 3}
+    # list memory
+    if t in ("我記得什麼", "我記得甚麼", "記得我甚麼", "我記得什麼事情"):
+        return Intent("LIST_MEMORY", {})
 
-        # 明天/後天
-        if "明天" in t:
-            return {"type": "weather", "city": city, "offset": 1}
-        if "後天" in t:
-            return {"type": "weather", "city": city, "offset": 2}
-        # 下週：先給 3 天（免費方案極限），提示主人可再問更長
-        if "下週" in t or "下周" in t:
-            return {"type": "weather", "city": city, "days": 3}
+    # date
+    if t in ("今天日期", "今天幾號", "今天星期幾", "現在日期", "現在時間", "今天日期時間"):
+        return Intent("DATE_NOW", {})
 
-        # 默認：今天
-        return {"type": "weather", "city": city, "offset": 0}
-
-    # 新聞（全球新聞 / 今日要聞 / 近7天新聞 / 指定關鍵字）
-    if re.search(r"(全球新聞|世界新聞|今日要聞|重大新聞|新聞重點)", t):
-        days = 7
-        m = re.search(r"(?:近|最近)\s*([0-9一二兩三四五六七八九十]+)\s*(?:天|日)", t)
+    # weather
+    if "天氣" in t:
+        # 例如：今天天氣 / 明天台中天氣 / 3天台中天氣 / 未來三天天氣 / 台中未來三天天氣
+        m = re.search(r"(\d+|[零〇一二兩三四五六七八九十]+)\s*天", t)
+        days = None
         if m:
             days = cn_to_int(m.group(1))
-        # 可加關鍵字：全球新聞 AI
-        q = t
-        q = re.sub(r"(全球新聞|世界新聞|今日要聞|重大新聞|新聞重點)", "全球 重大 新聞 重點", q).strip()
-        return {"type": "news", "query": q, "days": days, "count": 8}
+        if "明天" in t:
+            days = 2  # 明天等於 forecast 至少 2 天（含今天）
+        # city
+        city = None
+        m2 = re.search(r"(台北|臺北|台中|臺中|台南|臺南|高雄|桃園|新竹|基隆|嘉義|彰化|南投|雲林|屏東|宜蘭|花蓮|台東|臺東|澎湖|金門|馬祖)\S*", t)
+        if m2:
+            city = m2.group(0).strip()
 
-    # 今日運勢 / 我的運勢 / 獅子座運勢
-    if re.search(r"(今日運勢|我的運勢|運勢)", t):
-        z = None
-        for zz in ZODIACS:
-            if zz in t:
-                z = zz
-                break
-        return {"type": "horoscope", "zodiac": z}
+        if days and days >= 2:
+            return Intent("WEATHER_FORECAST", {"city": city, "days": min(max(days, 2), 10)})
+        # 沒寫幾天就當現在
+        return Intent("WEATHER_NOW", {"city": city})
 
-    # 記住（共享/私密）
-    if t.startswith("記住"):
-        scope = "private"
-        # 記住(共享) 或 記住 共享：...
-        if "共享" in t[:12]:
-            scope = "shared"
-        content = re.sub(r"^記住(\(共享\))?\s*[:：]?\s*", "", t).strip()
-        if not content:
-            content = "（空白記憶）"
-        return {"type": "remember", "scope": scope, "content": content}
+    # horoscope
+    if "運勢" in t:
+        return Intent("HOROSCOPE_TODAY", {})
 
-    if t in ["我記得什麼", "我記得甚麼", "我記得哪些", "我記得啥", "我記得什麼嗎", "我記得甚麼嗎", "我記得什麼？", "我記得甚麼？", "我記得什麼呢", "我記得甚麼呢"]:
-        return {"type": "list_memory"}
+    # news
+    if t.startswith("看新聞"):
+        m = re.search(r"(\d+)", t)
+        if m:
+            return Intent("NEWS_DETAIL", {"index": int(m.group(1))})
+        return Intent("NEWS_DETAIL", {"index": 1})
 
-    # 提醒：N分鐘後提醒(我)xxx / N分鐘後提醒 夫人 xxx / 2026-02-14 18:30 提醒 xxx
-    # 1) 絕對時間
-    m = re.search(r"(\d{4}-\d{2}-\d{2})\s*(\d{1,2}:\d{2})\s*提醒\s*(.+)", t)
-    if m:
-        dt = dtparser.parse(f"{m.group(1)} {m.group(2)}").replace(tzinfo=TZ)
-        return {"type": "remind", "due_at": dt, "message": m.group(3).strip()}
+    if "新聞" in t or "要聞" in t:
+        # 可指定天數：7天內新聞 / 3天新聞
+        m = re.search(r"(\d+|[零〇一二兩三四五六七八九十]+)\s*天", t)
+        days = 7
+        if m:
+            days = cn_to_int(m.group(1))
+        return Intent("NEWS", {"query": "全球重大新聞", "days": min(max(days, 1), 30), "limit": 8})
 
-    # 2) 相對時間（中文/數字都行）
-    m = re.search(r"([0-9一二兩三四五六七八九十百]+)\s*(分鐘|小時|天)\s*後\s*提醒(?:我)?\s*(.+)", t)
-    if m:
-        n = cn_to_int(m.group(1))
-        unit = m.group(2)
-        msg = m.group(3).strip()
-        delta = timedelta(minutes=n) if unit == "分鐘" else timedelta(hours=n) if unit == "小時" else timedelta(days=n)
-        return {"type": "remind", "due_at": datetime.now(TZ) + delta, "message": msg}
+    # morning brief now
+    if t in ("晨報", "今日晨報", "給我晨報"):
+        return Intent("MORNING_NOW", {})
 
-    # 3) 相對時間 + 指定對象
-    m = re.search(r"([0-9一二兩三四五六七八九十百]+)\s*(分鐘|小時|天)\s*後\s*提醒\s*([^\s]+)\s*(.+)", t)
-    if m:
-        n = cn_to_int(m.group(1))
-        unit = m.group(2)
-        target = m.group(3).strip()
-        msg = m.group(4).strip()
-        delta = timedelta(minutes=n) if unit == "分鐘" else timedelta(hours=n) if unit == "小時" else timedelta(days=n)
-        return {"type": "remind", "due_at": datetime.now(TZ) + delta, "message": msg, "target_alias": target}
+    # reminders (natural)
+    # 兩分鐘後提醒 喝水 / 1分鐘後提醒夫人 買晚餐 / 明天18:30提醒 帶尿布
+    if "提醒" in t:
+        due_at = parse_due_at(t, tz_name=tz_name)
+        if due_at:
+            # 提取對象（提醒夫人 / 提醒老公）
+            target = None
+            m = re.search(r"提醒\s*(給|給我|我)?\s*(\S+)?\s*(.+)$", t)
+            title = t
+            if m:
+                maybe_target = m.group(2)
+                rest = m.group(3).strip() if m.group(3) else ""
+                # 判斷 m.group(2) 是否其實是內容的一部分
+                if maybe_target and len(maybe_target) <= 6 and "後" not in maybe_target and ":" not in maybe_target:
+                    # 可能是人名/稱呼
+                    target = maybe_target
+                    title = rest
+                else:
+                    title = rest or t
+            title = re.sub(r".*提醒\s*(給|給我|我)?\s*\S*\s*", "", t).strip()
+            title = title if title else "提醒事項"
+            return Intent("REMIND", {"due_at": due_at, "title": title, "target": target})
 
-    # 我的提醒 / 取消提醒
-    if re.search(r"(我的提醒|提醒清單|待辦)", t):
-        return {"type": "list_tasks"}
-    m = re.search(r"(?:取消提醒|刪除提醒)\s*(\d+)", t)
-    if m:
-        return {"type": "cancel_task", "task_id": m.group(1)}
-
-    # 傳訊給X ...
-    m = re.search(r"(?:傳訊給|轉告|告訴|跟)\s*([^\s]+)\s*(?:說)?\s*(.+)", t)
-    if m and len(m.group(1)) <= 20:
-        return {"type": "send", "target_alias": m.group(1).strip(), "message": m.group(2).strip()}
-
-    # 預設：一般聊天
-    return {"type": "chat"}
+    return Intent("UNKNOWN", {})
