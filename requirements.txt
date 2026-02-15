@@ -1,7 +1,9 @@
 flask==3.0.3
 gunicorn==21.2.0
+line-bot-sdk==3.14.2
 requests==2.32.3
-python-dateutil==2.9.0.post0
 supabase==2.6.0
 google-generativeai==0.8.3
-line-bot-sdk==3.14.2
+APScheduler==3.10.4
+python-dateutil==2.9.0.post0
+tzlocal==5.3.1
