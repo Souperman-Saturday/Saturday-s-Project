@@ -1,70 +1,57 @@
 import requests
 
+def _get(url: str, timeout: int = 10):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-def _weatherapi_get(url: str, params: dict) -> dict | None:
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
-
-
-def get_weather_now(api_key: str, city: str) -> str | None:
+def weather_resolve_location(api_key: str, city: str) -> dict:
     """
-    WeatherAPI：Current Weather
-    Docs: weatherapi.com :contentReference[oaicite:1]{index=1}
+    用 search.json 把城市對到 WeatherAPI 的 query
     """
-    if not api_key:
-        return None
-
-    url = "https://api.weatherapi.com/v1/current.json"
-    data = _weatherapi_get(url, {"key": api_key, "q": city, "lang": "zh"})
+    city = (city or "").strip()
+    url = f"https://api.weatherapi.com/v1/search.json?key={api_key}&q={city}"
+    data = _get(url)
     if not data:
-        return None
+        # fallback：直接用 city 當 query
+        return {"name": city, "query": city}
+    top = data[0]
+    name = f"{top.get('name','')}"
+    region = top.get("region") or ""
+    country = top.get("country") or ""
+    display = " / ".join([x for x in [name, region, country] if x])
+    # WeatherAPI 接受 q=lat,lon 或 q=名稱
+    query = f"{top.get('lat')},{top.get('lon')}"
+    return {"name": display, "query": query}
 
-    loc = data.get("location", {})
-    cur = data.get("current", {})
-    cond = (cur.get("condition") or {}).get("text", "")
+def weather_current(api_key: str, query: str, lang: str="zh"):
+    url = f"https://api.weatherapi.com/v1/current.json?key={api_key}&q={query}&lang={lang}"
+    data = _get(url)
+    cur = data["current"]
+    return {
+        "text": cur["condition"]["text"],
+        "temp_c": cur["temp_c"],
+        "feelslike_c": cur["feelslike_c"],
+        "humidity": cur["humidity"],
+        "wind_kph": cur["wind_kph"]
+    }
 
-    name = loc.get("name", city)
-    temp_c = cur.get("temp_c")
-    feels = cur.get("feelslike_c")
-    hum = cur.get("humidity")
-    wind_kph = cur.get("wind_kph")
-
-    return (
-        f"{name}：{cond}\n"
-        f"氣溫 {temp_c}°C（體感 {feels}°C）｜濕度 {hum}%｜風速 {wind_kph} km/h"
-    )
-
-
-def get_weather_forecast(api_key: str, city: str, days: int = 3) -> str | None:
+def weather_forecast_days(api_key: str, query: str, days: int = 3, lang: str="zh"):
     """
-    WeatherAPI：Forecast
-    Docs: weatherapi.com :contentReference[oaicite:2]{index=2}
+    免費通常支援 3 days forecast（依方案）
     """
-    if not api_key:
-        return None
-
-    url = "https://api.weatherapi.com/v1/forecast.json"
     days = max(1, min(int(days), 3))
-    data = _weatherapi_get(url, {"key": api_key, "q": city, "days": days, "lang": "zh"})
-    if not data:
-        return None
-
-    loc = data.get("location", {})
-    fc = (data.get("forecast") or {}).get("forecastday") or []
-    name = loc.get("name", city)
-
-    lines = [f"{name} 未來 {days} 天："]
-    for d in fc:
-        date = d.get("date")
-        day = d.get("day", {})
-        cond = (day.get("condition") or {}).get("text", "")
-        maxt = day.get("maxtemp_c")
-        mint = day.get("mintemp_c")
-        rain = day.get("daily_chance_of_rain")
-        lines.append(f"- {date}：{cond}｜{mint}~{maxt}°C｜降雨機率 {rain}%")
-    return "\n".join(lines)
+    url = f"https://api.weatherapi.com/v1/forecast.json?key={api_key}&q={query}&days={days}&lang={lang}"
+    data = _get(url)
+    fds = data["forecast"]["forecastday"]
+    out = []
+    for d in fds:
+        day = d["day"]
+        out.append({
+            "date": d["date"],
+            "text": day["condition"]["text"],
+            "min_c": day["mintemp_c"],
+            "max_c": day["maxtemp_c"],
+            "chance_rain": day.get("daily_chance_of_rain", 0)
+        })
+    return out
