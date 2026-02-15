@@ -1,134 +1,125 @@
 import re
-from datetime import datetime, timedelta
-from dateutil import tz
+from dataclasses import dataclass
+from typing import Optional
+from tools_time import parse_datetime_tz, parse_minutes_after
 
-TZ = tz.gettz("Asia/Taipei")
+@dataclass
+class Intent:
+    kind: str
 
-def is_group_source(source_type: str) -> bool:
-    return source_type in ("group", "room")
+    # profile
+    city: Optional[str] = None
+    zodiac: Optional[str] = None
+    morning_time: Optional[str] = None
 
-def norm_time_hhmm(s: str) -> str | None:
-    m = re.search(r"(\d{1,2})[:：](\d{2})", s)
-    if not m:
-        return None
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if 0 <= hh <= 23 and 0 <= mm <= 59:
-        return f"{hh:02d}:{mm:02d}"
-    return None
+    # alias
+    alias: Optional[str] = None
+    target_user_id: Optional[str] = None
 
-def parse_reminder(text: str) -> tuple[str, str] | None:
-    """
-    支援：
-      - 提醒我 10分鐘後 喝水
-      - 提醒我 1分鐘後 喝水
-      - 提醒我 2026-02-14 19:30 去接小孩
-    回傳 (due_iso, task_text)
-    """
+    # send message
+    message: Optional[str] = None
+
+    # reminders
+    run_at: Optional[object] = None  # datetime
+    # memory
+    content: Optional[str] = None
+    query: Optional[str] = None
+    visibility: str = "private"
+
+def parse_user_intent(text: str) -> Intent:
     t = text.strip()
 
-    # N分鐘後
-    m = re.search(r"提醒我\s*(\d+)\s*分鐘後\s*(.+)$", t)
+    if t in ("指令", "help", "Help", "HELP", "幫助"):
+        return Intent(kind="help")
+
+    if t in ("隱私", "隱私設定", "私密"):
+        return Intent(kind="privacy_intro")
+
+    # 設定城市/星座/晨報
+    m = re.match(r"^(設定城市|城市設定)\s+(.+)$", t)
     if m:
-        n = int(m.group(1))
-        task_text = m.group(2).strip()
-        due = datetime.now(TZ) + timedelta(minutes=n)
-        return (due.isoformat(), task_text)
+        return Intent(kind="set_profile", city=m.group(2).strip())
 
-    # YYYY-MM-DD HH:MM
-    m = re.search(r"提醒我\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2})[:：](\d{2})\s*(.+)$", t)
+    m = re.match(r"^(設定星座|星座設定)\s+(.+)$", t)
     if m:
-        y, mo, d, hh, mm = map(int, [m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)])
-        task_text = m.group(6).strip()
-        due = datetime(y, mo, d, hh, mm, tzinfo=TZ)
-        return (due.isoformat(), task_text)
+        return Intent(kind="set_profile", zodiac=m.group(2).strip())
 
-    return None
+    m = re.match(r"^(設定晨報時間|晨報時間)\s+(\d{2}:\d{2})$", t)
+    if m:
+        return Intent(kind="set_profile", morning_time=m.group(2))
 
-def extract_command(text: str) -> tuple[str, str]:
-    """
-    回傳 (cmd, args)
-    cmd: lowercase
-    """
-    t = text.strip()
-    # 快捷
-    if t.lower() in ("ping",):
-        return ("ping", "")
-    if t in ("狀態",):
-        return ("status", "")
-    if t in ("我的設定",):
-        return ("my_settings", "")
-    if t.startswith("設定城市"):
-        return ("set_city", t.replace("設定城市", "", 1).strip())
-    if t.startswith("設定星座"):
-        return ("set_zodiac", t.replace("設定星座", "", 1).strip())
-    if t.startswith("設定晨報時間"):
-        return ("set_morning_time", t.replace("設定晨報時間", "", 1).strip())
-    if t in ("開啟晨報",):
-        return ("morning_on", "")
-    if t in ("關閉晨報",):
-        return ("morning_off", "")
-    if t in ("發送晨報",):
-        return ("send_morning", "")
+    # 設定別名 夫人 Uxxxx
+    m = re.match(r"^設定別名\s+(\S+)\s+(U[a-fA-F0-9]{32}|U\w+)$", t)
+    if m:
+        return Intent(kind="set_alias", alias=m.group(1), target_user_id=m.group(2))
 
-    if t.startswith("設定新聞數量"):
-        return ("set_news_count", t.replace("設定新聞數量", "", 1).strip())
+    # 傳訊給夫人 ... / 傳話給夫人 ...
+    m = re.match(r"^(傳訊給|傳話給)\s+(\S+)\s+(.+)$", t)
+    if m:
+        return Intent(kind="send_to_alias", alias=m.group(2), message=m.group(3).strip())
 
-    if t.startswith("設定家人"):
-        # 設定家人 Uxxx=夫人
-        return ("set_contact", t.replace("設定家人", "", 1).strip())
-    if t.startswith("刪除家人"):
-        return ("delete_contact", t.replace("刪除家人", "", 1).strip())
-    if t in ("家人清單",):
-        return ("list_contacts", "")
+    # 晨報（立即）
+    if t in ("發送晨報", "給我晨報", "晨報"):
+        return Intent(kind="morning_now")
 
-    if t.startswith("傳訊給"):
-        return ("relay", t.replace("傳訊給", "", 1).strip())
+    # 天氣：今天/下週/某地
+    if "天氣" in t:
+        # 例：台中天氣、下週台北天氣
+        city = None
+        m = re.match(r"^(.+?)\s*天氣", t)
+        if m:
+            maybe = m.group(1).strip()
+            if maybe and maybe not in ("今天", "明天", "下週", "下周"):
+                city = maybe
+        return Intent(kind="weather", city=city)
 
+    # 星座運勢
+    if "運勢" in t or "星座" in t:
+        z = None
+        m = re.match(r"^(.+?)\s*(今日)?運勢", t)
+        if m:
+            maybe = m.group(1).strip()
+            if maybe and maybe not in ("今日", "今天"):
+                z = maybe
+        return Intent(kind="horoscope", zodiac=z)
+
+    # 新聞
+    if "新聞" in t or "要聞" in t or "全球新聞" in t:
+        return Intent(kind="news")
+
+    # 記住（私密/共享）
+    m = re.match(r"^記住(共享|私密)?\s+(.+)$", t)
+    if m:
+        vis = "private"
+        if m.group(1) == "共享":
+            vis = "shared"
+        return Intent(kind="remember", content=m.group(2).strip(), visibility=vis)
+
+    # 想起 / 回想
+    m = re.match(r"^(我記得什麼|想起|回想)\s+(.+)$", t)
+    if m:
+        return Intent(kind="recall", query=m.group(2).strip())
+
+    # 提醒：N分鐘後 / 指定日期
+    # 提醒我 10分鐘後 喝水
     if t.startswith("提醒我"):
-        return ("remind", t)
+        # 先試 N分鐘後
+        dt = parse_minutes_after(t)
+        msg = extract_reminder_message(t)
+        if dt:
+            return Intent(kind="create_reminder", run_at=dt, message=msg)
+        # 再試 YYYY-MM-DD HH:MM
+        dt = parse_datetime_tz(t)
+        if dt:
+            return Intent(kind="create_reminder", run_at=dt, message=msg)
+        return Intent(kind="create_reminder", run_at=None, message=msg)
 
-    if t in ("我的提醒",):
-        return ("list_tasks", "")
+    return Intent(kind="fallback")
 
-    if t.startswith("取消提醒"):
-        return ("cancel_task", t.replace("取消提醒", "", 1).strip())
-
-    if t.startswith("記住"):
-        return ("remember", t)
-
-    if t in ("查看記憶",):
-        return ("list_memories", "")
-    if t in ("清除記憶",):
-        return ("clear_memories", "")
-
-    return ("chat", t)
-
-def parse_contact_set(arg: str) -> tuple[str, str] | None:
-    # Uxxx=夫人
-    m = re.search(r"(U[0-9a-fA-F]{10,})\s*=\s*(\S+)", arg)
-    if not m:
-        return None
-    return (m.group(1), m.group(2))
-
-def parse_relay(arg: str) -> tuple[str, str] | None:
-    # 夫人 我晚點回家
-    parts = arg.strip().split(None, 1)
-    if len(parts) < 2:
-        return None
-    return (parts[0], parts[1].strip())
-
-def parse_remember(text: str) -> tuple[str, str] | None:
-    # 記住(共享) xxx
-    m = re.search(r"^記住(\((共享|私密)\))?\s*(.+)$", text.strip())
-    if not m:
-        return None
-    scope = "private"
-    if m.group(2) == "共享":
-        scope = "shared"
-    if m.group(2) == "私密":
-        scope = "private"
-    content = (m.group(3) or "").strip()
-    if not content:
-        return None
-    return (scope, content)
+def extract_reminder_message(t: str) -> str:
+    # 移除「提醒我」「10分鐘後」「YYYY-MM-DD HH:MM」
+    msg = t
+    msg = re.sub(r"^提醒我\s*", "", msg)
+    msg = re.sub(r"\d+\s*分鐘後\s*", "", msg)
+    msg = re.sub(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s*", "", msg)
+    return msg.strip() or "（未填內容）"
