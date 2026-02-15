@@ -1,46 +1,28 @@
-import os
-import requests
-from datetime import datetime
+import datetime
+from zoneinfo import ZoneInfo
 
-SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+import google.generativeai as genai
 
-def _serper_search(q: str, recency: str = "d", gl: str = "tw", hl: str = "zh-tw", num: int = 5) -> dict:
-    url = "https://google.serper.dev/search"
-    headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
-    payload = {"q": q, "gl": gl, "hl": hl, "num": num}
-    if recency:
-        payload["tbs"] = f"qdr:{recency}"  # d=day, w=week
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
 
-def get_horoscope_today(zodiac: str) -> str:
-    """
-    用 Serper 搜尋近24h 的星座內容，再做精簡中文整理。
-    """
-    if not SERPER_API_KEY:
-        raise RuntimeError("SERPER_API_KEY not set")
+def generate_horoscope_cn(gemini_key: str, zodiac_cn: str, tz: str = "Asia/Taipei") -> str:
+    if not gemini_key:
+        return "（Gemini API Key 未設定，無法產生運勢）"
 
-    q = f"{zodiac} 今日運勢"
-    data = _serper_search(q, recency="d", num=5)
+    genai.configure(api_key=gemini_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
 
-    snippets = []
-    for item in (data.get("organic") or [])[:5]:
-        title = item.get("title", "")
-        snippet = item.get("snippet", "")
-        link = item.get("link", "")
-        if snippet:
-            snippets.append(f"{title}：{snippet}")
+    today = datetime.datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
 
-    if not snippets:
-        return f"【{zodiac} 今日運勢】\n我目前找不到可靠的近24小時內容。"
+    prompt = f"""\
+你是台灣使用者的生活管家。請用全中文寫「{zodiac_cn}」在 {today} 的今日運勢：
+- 3~5 句，口吻溫暖但務實
+- 包含：整體、工作/學業、人際、健康、提醒一句
+- 不要迷信恐嚇、不提任何需要查證的事實
+"""
 
-    # 先不強依賴 Gemini，避免額度/鍵問題
-    # 直接做 rule-based 精簡
-    merged = "；".join(snippets)
-    merged = merged.replace("\n", " ")
-    if len(merged) > 380:
-        merged = merged[:380] + "…"
-
-    return f"【{zodiac} 今日運勢（近24h 摘要）】\n{merged}"
+    try:
+        r = model.generate_content(prompt)
+        text = (r.text or "").strip()
+        return text if text else "（運勢產生失敗，請稍後再試）"
+    except Exception:
+        return "（運勢工具暫時失敗，請稍後再試）"
