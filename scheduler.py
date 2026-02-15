@@ -1,45 +1,77 @@
 import os
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from dateutil import tz
 
-from memory import (
-    fetch_due_tasks, mark_task_sent,
-    ensure_profile, morning_already_sent, mark_morning_sent
-)
-from tools import now_tz
-from app import push_text, build_morning_report  # 由 app.py 提供
+from memory import DB
 
-TZ = os.getenv("TZ", "Asia/Taipei")
+TZNAME = os.getenv("TZ", "Asia/Taipei")
+TZ = tz.gettz(TZNAME)
 
-def run_cron_once():
-    # 1) 送到期提醒
-    due = fetch_due_tasks(limit=50)
-    for task in due:
-        owner = task["owner_user_id"]
-        payload = task["payload"]
-        push_text(owner, f"⏰ 提醒：{payload}")
-        mark_task_sent(task["id"])
+scheduler = BackgroundScheduler(timezone=TZ)
+_db: DB | None = None
+_push_fn = None  # function(user_id, text)
 
-    # 2) 晨報：到點送一次（每個 user 每天一次）
-    now = now_tz()
-    today = now.date().isoformat()
+def init_scheduler(db: DB, push_fn):
+    global _db, _push_fn
+    _db = db
+    _push_fn = push_fn
 
-    # 目前你是「單一管家（你＋夫人）」：用環境變數列出要送的人
-    targets = [os.getenv("MY_ID"), os.getenv("WIFE_ID")]
-    targets = [t for t in targets if t]
+    if not scheduler.running:
+        scheduler.start()
 
-    for uid in targets:
-        prof = ensure_profile(uid)
-        hhmm = prof.get("morning_time", "07:00")
+    # 每 20 秒掃 pending tasks
+    scheduler.add_job(send_due_tasks, "interval", seconds=20, id="scan_tasks", replace_existing=True)
+    # 每分鐘檢查晨報（依 user profile 動態）
+    scheduler.add_job(scan_morning_reports, "interval", seconds=30, id="scan_morning", replace_existing=True)
+
+def send_due_tasks():
+    if not _db or not _push_fn:
+        return
+    now_iso = datetime.now(TZ).isoformat()
+    due = _db.due_tasks(now_iso)
+    for t in due:
         try:
-            hh, mm = hhmm.split(":")
-            target_time = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            _push_fn(t["subject_id"], f"⏰ 提醒：{t['text']}")
+            _db.mark_task_sent(t["id"])
         except Exception:
-            continue
+            # 不要讓 scheduler 斷
+            pass
 
-        # 允許 0~3 分鐘內觸發（避免 cron 漏掉）
-        if now >= target_time and (now - target_time).total_seconds() <= 180:
-            if not morning_already_sent(uid, today):
-                text = build_morning_report(uid, prof)
-                push_text(uid, text)
-                mark_morning_sent(uid, today)
+def scan_morning_reports():
+    if not _db or not _push_fn:
+        return
+
+    # 找所有晨報開啟的 profiles
+    # supabase python 取全部 profiles：保守 limit 200
+    try:
+        sb = _db.sb
+        r = sb.table("saturday_profiles").select("user_id,morning_enabled,morning_time,city,zodiac,news_count").eq("morning_enabled", True).limit(200).execute()
+        profiles = r.data or []
+    except Exception:
+        return
+
+    now = datetime.now(TZ)
+    hhmm = now.strftime("%H:%M")
+    # 只在「當分鐘」發一次：用 tasks 表做鎖（更穩），但先用 processed marker in memories table? 這裡用簡易記憶：每天每人一則 marker
+    # 使用 saturday_memories 寫入一條 shared marker: "MORNING_SENT:YYYY-MM-DD"
+    today = now.strftime("%Y-%m-%d")
+
+    for p in profiles:
+        try:
+            if (p.get("morning_time") or "07:00") != hhmm:
+                continue
+            uid = p["user_id"]
+            # check marker
+            existing = _db.list_memories(owner_id=uid, subject_id=uid, scopes=["private","shared"], limit=10)
+            marker = f"MORNING_SENT:{today}"
+            if any(marker in (m.get("content") or "") for m in existing):
+                continue
+            # 讓 app 內的 /morning endpoint 產生內容較乾淨：這裡只 push 一個 signal，由 app 組晨報內容
+            _push_fn(uid, "☀️ 先生，到了晨報時間，我正在為您整理今日晨報，稍等一下。")
+            # 用「待辦」的方式觸發：寫一個 0 分鐘後的 task，讓 app 的同一套流程生成晨報（更一致）
+            _db.add_task(uid, uid, datetime.now(TZ).isoformat(), "__SEND_MORNING__")
+            _db.add_memory(uid, uid, "private", marker)
+        except Exception:
+            pass
