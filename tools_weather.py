@@ -1,60 +1,70 @@
-import os
 import requests
 
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY", "")
 
-def get_weather_now(city: str) -> str:
-    if not WEATHER_API_KEY:
-        raise RuntimeError("WEATHER_API_KEY not set")
+def _weatherapi_get(url: str, params: dict) -> dict | None:
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_weather_now(api_key: str, city: str) -> str | None:
+    """
+    WeatherAPI：Current Weather
+    Docs: weatherapi.com :contentReference[oaicite:1]{index=1}
+    """
+    if not api_key:
+        return None
 
     url = "https://api.weatherapi.com/v1/current.json"
-    params = {
-        "key": WEATHER_API_KEY,
-        "q": city,
-        "aqi": "no",
-        "lang": "zh"
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    data = _weatherapi_get(url, {"key": api_key, "q": city, "lang": "zh"})
+    if not data:
+        return None
 
     loc = data.get("location", {})
     cur = data.get("current", {})
-    name = loc.get("name") or city
-    temp = cur.get("temp_c")
-    feels = cur.get("feelslike_c")
-    hum = cur.get("humidity")
-    wind = cur.get("wind_kph")
     cond = (cur.get("condition") or {}).get("text", "")
 
-    return f"{name}：{cond}，氣溫 {temp}°C（體感 {feels}°C），濕度 {hum}% ，風速 {wind} km/h"
+    name = loc.get("name", city)
+    temp_c = cur.get("temp_c")
+    feels = cur.get("feelslike_c")
+    hum = cur.get("humidity")
+    wind_kph = cur.get("wind_kph")
 
-def get_weather_forecast(city: str, days: int = 3) -> str:
-    if not WEATHER_API_KEY:
-        raise RuntimeError("WEATHER_API_KEY not set")
+    return (
+        f"{name}：{cond}\n"
+        f"氣溫 {temp_c}°C（體感 {feels}°C）｜濕度 {hum}%｜風速 {wind_kph} km/h"
+    )
+
+
+def get_weather_forecast(api_key: str, city: str, days: int = 3) -> str | None:
+    """
+    WeatherAPI：Forecast
+    Docs: weatherapi.com :contentReference[oaicite:2]{index=2}
+    """
+    if not api_key:
+        return None
 
     url = "https://api.weatherapi.com/v1/forecast.json"
-    params = {
-        "key": WEATHER_API_KEY,
-        "q": city,
-        "days": days,
-        "aqi": "no",
-        "alerts": "no",
-        "lang": "zh"
-    }
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    days = max(1, min(int(days), 3))
+    data = _weatherapi_get(url, {"key": api_key, "q": city, "days": days, "lang": "zh"})
+    if not data:
+        return None
 
+    loc = data.get("location", {})
     fc = (data.get("forecast") or {}).get("forecastday") or []
-    lines = []
+    name = loc.get("name", city)
+
+    lines = [f"{name} 未來 {days} 天："]
     for d in fc:
-        date = d.get("date", "")
+        date = d.get("date")
         day = d.get("day", {})
         cond = (day.get("condition") or {}).get("text", "")
         maxt = day.get("maxtemp_c")
         mint = day.get("mintemp_c")
         rain = day.get("daily_chance_of_rain")
-        lines.append(f"{date}：{cond}，{mint}~{maxt}°C，降雨機率 {rain}%")
-
-    return "\n".join(lines) if lines else "（預報資料不足）"
+        lines.append(f"- {date}：{cond}｜{mint}~{maxt}°C｜降雨機率 {rain}%")
+    return "\n".join(lines)
