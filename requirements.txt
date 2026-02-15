@@ -4,5 +4,8 @@ line-bot-sdk==3.14.2
 supabase==2.6.0
 google-generativeai==0.8.3
 requests==2.32.3
-python-dateutil==2.9.0.post0
 APScheduler==3.10.4
+python-dateutil==2.9.0.post0
+pytz==2025.2
+tzlocal==5.3.1
+lunardate==0.2.2
