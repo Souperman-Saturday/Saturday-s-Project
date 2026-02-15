@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from supabase import create_client
 
@@ -20,9 +20,11 @@ class SupaConfig:
 
 class Supa:
     """
-    Supabase 存取層（V7.1）
-    - 明確支援 Supa(SUPABASE_URL, SERVICE_ROLE_KEY)
-    - 提供通用 table/rpc + 常用功能（提醒/設定/記憶）
+    Supabase 存取層（V7.x 兼容版）
+    目標：
+    - 修掉 Supa.__init__ 參數錯誤
+    - 補回 app.py / scheduler.py 依賴的方法（get_context / list_morning_targets）
+    - 表或欄位不存在時「不崩潰」，回預設值，讓 webhook 可繼續回覆
     """
 
     def __init__(self, supabase_url: str, supabase_key: str):
@@ -38,41 +40,165 @@ class Supa:
         self.sb = create_client(self.cfg.url, self.cfg.key)
 
     # ----------------------------
-    # 基礎工具
+    # 基礎：讓外部可以繼續 table/rpc
     # ----------------------------
     def table(self, name: str):
-        """讓外部仍可用：supa.table('xxx').select(...).execute()"""
         return self.sb.table(name)
 
     def rpc(self, fn: str, args: Dict[str, Any]):
-        """讓外部仍可用：supa.rpc('match_memories', {...}).execute()"""
         return self.sb.rpc(fn, args)
 
     def ping(self) -> bool:
-        """
-        快速測試連線是否 OK：
-        - 只做一個非常輕量查詢（不依賴特定資料表內容）
-        """
+        """輕量連線測試（不保證表存在，只保證 key/url 可用）"""
         try:
-            # 任何專案都會有 auth schema，但 postgrest 不一定可 select。
-            # 所以用你已存在的表之一做輕量查詢（沒有也會回可讀錯）。
-            self.sb.table("saturday_reminders").select("id").limit(1).execute()
+            # 若表不存在也可能噴錯，但至少可以讓你在 log 看懂
+            self.sb.table("saturday_user_settings").select("user_id").limit(1).execute()
             return True
         except Exception as e:
             raise SupaError(f"Supabase 連線測試失敗：{e}") from e
 
     # ----------------------------
+    # 兼容：app.py 需要的 get_context
+    # ----------------------------
+    def get_context(self, user_id: str, default_owner_id: str = "", default_wife_id: str = "") -> Dict[str, Any]:
+        """
+        回傳使用者上下文（避免 app.py 因查不到綁定而炸掉）
+        結構盡量穩：
+        {
+          "user_id": "...",
+          "owner_id": "...",
+          "role": "先生|夫人|家人|訪客",
+          "is_owner": bool,
+          "tz": "Asia/Taipei"
+        }
+
+        綁定優先順序：
+        1) 若 user_id == default_owner_id => owner
+        2) 若 user_id == default_wife_id => wife (owner=default_owner_id)
+        3) 若有表 saturday_bindings（owner_id, member_id, label） => 依 member_id 找 owner
+        4) 都沒有 => 若 default_owner_id 有值：當訪客（owner=default_owner_id），否則 user 自己當 owner
+        """
+        user_id = (user_id or "").strip()
+        default_owner_id = (default_owner_id or "").strip()
+        default_wife_id = (default_wife_id or "").strip()
+
+        ctx = {
+            "user_id": user_id,
+            "owner_id": default_owner_id or user_id,
+            "role": "訪客",
+            "is_owner": False,
+            "tz": "Asia/Taipei",
+        }
+
+        # 1) default owner
+        if default_owner_id and user_id == default_owner_id:
+            ctx["owner_id"] = user_id
+            ctx["role"] = "先生"
+            ctx["is_owner"] = True
+            return ctx
+
+        # 2) default wife
+        if default_wife_id and user_id == default_wife_id:
+            ctx["owner_id"] = default_owner_id or user_id
+            ctx["role"] = "夫人"
+            ctx["is_owner"] = False
+            return ctx
+
+        # 3) 查綁定表（若存在）
+        # 表名固定用 saturday_bindings：owner_id, member_id, label
+        try:
+            res = (
+                self.sb.table("saturday_bindings")
+                .select("owner_id,label")
+                .eq("member_id", user_id)
+                .limit(1)
+                .execute()
+            )
+            row = (res.data or [None])[0]
+            if row and row.get("owner_id"):
+                ctx["owner_id"] = row["owner_id"]
+                # 若 label 是 "夫人" 就套用；否則統一叫「家人」
+                ctx["role"] = "夫人" if row.get("label") == "夫人" else "家人"
+                ctx["is_owner"] = False
+                return ctx
+        except Exception:
+            # 沒有表/沒權限/欄位不同都不該讓 webhook 爆炸
+            pass
+
+        # 4) fallback：如果 default_owner_id 有設，視為訪客；沒設就把 user 當 owner
+        if not default_owner_id:
+            ctx["owner_id"] = user_id
+            ctx["role"] = "先生"
+            ctx["is_owner"] = True
+        return ctx
+
+    # ----------------------------
+    # 兼容：scheduler.py 需要的 list_morning_targets
+    # ----------------------------
+    def list_morning_targets(self, hhmm: str) -> List[Dict[str, Any]]:
+        """
+        找出需要在 hhmm（例如 07:00）發晨報的 user（owner）
+        使用表：saturday_user_settings（user_id,key,value）
+        需要：
+          - key = 'morning_time' value = '07:00'
+        可選：
+          - key = 'morning_enabled' value = '1' / 'true' / 'on'
+
+        回傳 list[profile]：
+        [
+          {"user_id": "...", "owner_id": "...", "tz": "Asia/Taipei"}
+        ]
+        """
+        hhmm = (hhmm or "").strip()
+        if not hhmm:
+            return []
+
+        try:
+            # 取出 morning_time == hhmm 的 user_id 清單
+            res = (
+                self.sb.table("saturday_user_settings")
+                .select("user_id,value")
+                .eq("key", "morning_time")
+                .eq("value", hhmm)
+                .limit(500)
+                .execute()
+            )
+            rows = res.data or []
+            user_ids = list({r["user_id"] for r in rows if r.get("user_id")})
+
+            if not user_ids:
+                return []
+
+            # 若有 morning_enabled，就過濾掉 disabled
+            enabled_set: Optional[set] = None
+            try:
+                res2 = (
+                    self.sb.table("saturday_user_settings")
+                    .select("user_id,value")
+                    .eq("key", "morning_enabled")
+                    .in_("user_id", user_ids)
+                    .limit(500)
+                    .execute()
+                )
+                rows2 = res2.data or []
+                # 沒設定 morning_enabled 的當作 enabled
+                enabled_set = set(user_ids)
+                for r in rows2:
+                    v = str(r.get("value", "")).strip().lower()
+                    if v in ("0", "false", "off", "no"):
+                        enabled_set.discard(r.get("user_id"))
+            except Exception:
+                enabled_set = set(user_ids)
+
+            return [{"user_id": uid, "owner_id": uid, "tz": "Asia/Taipei"} for uid in sorted(enabled_set)]
+        except Exception:
+            # 表不存在/欄位不同/權限問題：不要讓 scheduler 炸
+            return []
+
+    # ----------------------------
     # 提醒（scheduler 會用到）
     # ----------------------------
     def fetch_due_reminders(self, now_yyyy_mm_dd_hhmm: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """
-        取出到期且待送的提醒（scheduler.py tick_reminders 會用到）
-        預期表：saturday_reminders
-        欄位建議：
-          - id (uuid or bigint)
-          - status: 'pending' / 'sent' / 'cancelled'
-          - due_at: 建議 timestamptz；若你是 text 也可（用 YYYY-MM-DD HH:MM）
-        """
         try:
             res = (
                 self.sb.table("saturday_reminders")
@@ -88,12 +214,9 @@ class Supa:
 
     def mark_reminder_sent(self, reminder_id: Any) -> None:
         try:
-            (
-                self.sb.table("saturday_reminders")
-                .update({"status": "sent", "sent_at": datetime.now(timezone.utc).isoformat()})
-                .eq("id", reminder_id)
-                .execute()
-            )
+            self.sb.table("saturday_reminders").update(
+                {"status": "sent", "sent_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", reminder_id).execute()
         except Exception as e:
             raise SupaError(f"mark_reminder_sent 失敗：{e}") from e
 
@@ -106,13 +229,6 @@ class Supa:
         created_by: Optional[str] = None,
         scope: str = "private",
     ) -> Dict[str, Any]:
-        """
-        建立提醒
-        - owner_id：誰建立（通常主用戶）
-        - target_id：要推播給誰
-        - due_at：建議 'YYYY-MM-DD HH:MM' 或 ISO string
-        - scope：private/shared（你要做家庭共享時可用）
-        """
         payload = {
             "owner_id": owner_id,
             "target_id": target_id,
@@ -143,11 +259,7 @@ class Supa:
             raise SupaError(f"list_reminders 失敗：{e}") from e
 
     def cancel_reminder(self, user_id: str, reminder_id: Any) -> bool:
-        """
-        取消提醒：只允許 owner / target 取消
-        """
         try:
-            # 先查權限
             r = self.sb.table("saturday_reminders").select("*").eq("id", reminder_id).limit(1).execute()
             row = (r.data or [None])[0]
             if not row:
@@ -164,10 +276,6 @@ class Supa:
     # 使用者設定（城市 / 星座 / 晨報時間 等）
     # ----------------------------
     def upsert_user_setting(self, user_id: str, key: str, value: str) -> None:
-        """
-        建議表：saturday_user_settings
-        欄位：user_id, key, value, updated_at
-        """
         payload = {
             "user_id": user_id,
             "key": key,
@@ -175,7 +283,6 @@ class Supa:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         try:
-            # upsert 需要表上有 unique(user_id, key)
             self.sb.table("saturday_user_settings").upsert(payload, on_conflict="user_id,key").execute()
         except Exception as e:
             raise SupaError(f"upsert_user_setting 失敗（表/unique 可能未建）：{e}") from e
@@ -206,10 +313,6 @@ class Supa:
         embedding: Optional[List[float]] = None,
         importance: int = 1,
     ) -> None:
-        """
-        建議表：saturday_memories
-        欄位：id(uuid), user_id, scope, content, embedding(vector), importance(int), created_at
-        """
         payload: Dict[str, Any] = {
             "user_id": user_id,
             "scope": scope,
@@ -251,10 +354,6 @@ class Supa:
         match_count: int = 5,
         scope: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        你 Supabase 需要有 RPC：match_memories(...)
-        若你有 scope 欄位，可在 SQL function 內做過濾；否則在這裡事後過濾
-        """
         try:
             res = self.sb.rpc(
                 "match_memories",
