@@ -1,28 +1,37 @@
-import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime
+from tools_news import serper_web_search_recent
 
-import google.generativeai as genai
+def horoscope_today(serper_key: str, zodiac: str, now_dt: datetime) -> str:
+    """
+    運勢用搜尋整合（不靠神秘星座 API）
+    原理：抓近 7 天內的結果，整理成一段好讀的管家口吻。
+    """
+    q = f"{zodiac} 今日運勢"
+    results = serper_web_search_recent(
+        serper_key, q,
+        now_dt=now_dt,
+        max_items=5,
+        max_age_days=7,
+        hl="zh-tw",
+        gl="tw"
+    )
+    if not results:
+        return "（我暫時抓不到可靠的今日運勢來源，你要不要我換個關鍵字再試？例如：星座運勢 今日）"
 
+    # 用 snippet 組出簡短運勢（避免爬網頁、避免超慢）
+    snippets = []
+    for r in results[:3]:
+        s = (r.get("snippet") or "").strip()
+        if s:
+            snippets.append(s)
 
-def generate_horoscope_cn(gemini_key: str, zodiac_cn: str, tz: str = "Asia/Taipei") -> str:
-    if not gemini_key:
-        return "（Gemini API Key 未設定，無法產生運勢）"
+    if not snippets:
+        return "（我有找到來源，但摘要內容不足；你要不要我改成：直接給你來源連結？）"
 
-    genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # 管家式濃縮（100~160字）
+    text = " ".join(snippets)
+    text = text.replace("\n", " ").strip()
+    if len(text) > 180:
+        text = text[:180].rstrip("，。、； ") + "…"
 
-    today = datetime.datetime.now(ZoneInfo(tz)).strftime("%Y-%m-%d")
-
-    prompt = f"""\
-你是台灣使用者的生活管家。請用全中文寫「{zodiac_cn}」在 {today} 的今日運勢：
-- 3~5 句，口吻溫暖但務實
-- 包含：整體、工作/學業、人際、健康、提醒一句
-- 不要迷信恐嚇、不提任何需要查證的事實
-"""
-
-    try:
-        r = model.generate_content(prompt)
-        text = (r.text or "").strip()
-        return text if text else "（運勢產生失敗，請稍後再試）"
-    except Exception:
-        return "（運勢工具暫時失敗，請稍後再試）"
+    return f"{zodiac}｜今日重點：{text}"
