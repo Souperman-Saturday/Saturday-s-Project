@@ -1,138 +1,124 @@
 import os
-from datetime import datetime
-from zoneinfo import ZoneInfo
 from supabase import create_client
-import google.generativeai as genai
 
-TZ = os.getenv("TZ", "Asia/Taipei")
+SUPA_URL = os.getenv("SUPABASE_URL", "")
+SUPA_KEY = os.getenv("SUPABASE_KEY", "")
 
-def _now():
-    return datetime.now(ZoneInfo(TZ))
+class DB:
+    def __init__(self):
+        if not SUPA_URL or not SUPA_KEY:
+            raise RuntimeError("SUPABASE_URL / SUPABASE_KEY 未設定")
+        self.sb = create_client(SUPA_URL, SUPA_KEY)
 
-def get_supabase():
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
-    if not url or not key:
-        raise RuntimeError("SUPABASE_URL / SUPABASE_KEY 未設定")
-    return create_client(url, key)
+    # ---------- processed events (idempotency) ----------
+    def seen_event(self, webhook_event_id: str) -> bool:
+        if not webhook_event_id:
+            return False
+        r = self.sb.table("saturday_processed_events").select("webhook_event_id").eq("webhook_event_id", webhook_event_id).execute()
+        return bool(r.data)
 
-def get_gemini():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY 未設定")
-    genai.configure(api_key=api_key)
-    return genai
+    def mark_event(self, webhook_event_id: str) -> None:
+        if not webhook_event_id:
+            return
+        # upsert style: insert ignore conflict
+        try:
+            self.sb.table("saturday_processed_events").insert({"webhook_event_id": webhook_event_id}).execute()
+        except Exception:
+            pass
 
-def embed_text(text: str):
-    g = get_gemini()
-    try:
-        res = g.embed_content(
-            model="models/text-embedding-004",
-            content=text,
-            task_type="retrieval_document"
-        )
-        return res["embedding"]
-    except Exception as e:
-        # embedding 失敗就回 None（仍可存，但向量搜尋會少一點效果）
-        return None
+    # ---------- profiles ----------
+    def get_profile(self, user_id: str):
+        r = self.sb.table("saturday_profiles").select("*").eq("user_id", user_id).limit(1).execute()
+        return (r.data[0] if r.data else None)
 
-def ensure_profile(line_user_id: str, display_name: str | None = None):
-    sb = get_supabase()
-    existing = sb.table("saturday_profiles").select("*").eq("line_user_id", line_user_id).execute()
-    if existing.data:
-        return existing.data[0]
-    payload = {
-        "line_user_id": line_user_id,
-        "display_name": display_name,
-        "home_city": "台中市",
-        "zodiac": "獅子座",
-        "morning_time": "07:00",
-        "news_lang": "zh-TW",
-        "news_region": "TW",
-        "family_share_default": False
-    }
-    ins = sb.table("saturday_profiles").insert(payload).execute()
-    return ins.data[0]
+    def ensure_profile(self, user_id: str, display_name: str | None = None):
+        p = self.get_profile(user_id)
+        if p:
+            return p
+        payload = {"user_id": user_id, "display_name": display_name or None}
+        self.sb.table("saturday_profiles").insert(payload).execute()
+        return self.get_profile(user_id)
 
-def update_profile(line_user_id: str, **kwargs):
-    sb = get_supabase()
-    kwargs["updated_at"] = _now().isoformat()
-    upd = sb.table("saturday_profiles").update(kwargs).eq("line_user_id", line_user_id).execute()
-    return upd.data[0] if upd.data else None
+    def update_profile(self, user_id: str, patch: dict):
+        self.sb.table("saturday_profiles").update(patch).eq("user_id", user_id).execute()
+        return self.get_profile(user_id)
 
-def add_memory(owner_user_id: str, content: str, memory_type: str = "long", scope: str = "private", importance: int = 1):
-    sb = get_supabase()
-    emb = None
-    if memory_type in ("long", "pref"):
-        emb = embed_text(content)
-    row = {
-        "owner_user_id": owner_user_id,
-        "content": content,
-        "memory_type": memory_type,
-        "scope": scope,
-        "importance": importance,
-        "embedding": emb
-    }
-    ins = sb.table("saturday_memories").insert(row).execute()
-    return ins.data[0] if ins.data else None
+    # ---------- contacts ----------
+    def set_contact_alias(self, owner_id: str, contact_id: str, alias: str):
+        # remove existing by alias or contact_id
+        self.sb.table("saturday_contacts").delete().eq("owner_id", owner_id).eq("alias", alias).execute()
+        self.sb.table("saturday_contacts").delete().eq("owner_id", owner_id).eq("contact_id", contact_id).execute()
+        self.sb.table("saturday_contacts").insert({
+            "owner_id": owner_id,
+            "contact_id": contact_id,
+            "alias": alias
+        }).execute()
 
-def search_memories(owner_user_id: str, query: str, scope: str = "private", k: int = 6, threshold: float = 0.68):
-    sb = get_supabase()
-    qemb = embed_text(query)
-    if not qemb:
-        return []
-    res = sb.rpc("match_memories", {
-        "query_embedding": qemb,
-        "match_threshold": threshold,
-        "match_count": k,
-        "p_owner_user_id": owner_user_id,
-        "p_scope": scope
-    }).execute()
-    return res.data or []
+    def delete_contact_alias(self, owner_id: str, alias: str):
+        self.sb.table("saturday_contacts").delete().eq("owner_id", owner_id).eq("alias", alias).execute()
 
-def add_task(owner_user_id: str, due_at_iso: str, payload: str, scope: str = "private"):
-    sb = get_supabase()
-    row = {
-        "owner_user_id": owner_user_id,
-        "due_at": due_at_iso,
-        "payload": payload,
-        "scope": scope,
-        "status": "pending"
-    }
-    ins = sb.table("saturday_tasks").insert(row).execute()
-    return ins.data[0] if ins.data else None
+    def list_contacts(self, owner_id: str):
+        r = self.sb.table("saturday_contacts").select("alias,contact_id").eq("owner_id", owner_id).execute()
+        return r.data or []
 
-def fetch_due_tasks(limit: int = 50):
-    sb = get_supabase()
-    now_iso = _now().isoformat()
-    res = (sb.table("saturday_tasks")
-           .select("*")
-           .eq("status", "pending")
-           .lte("due_at", now_iso)
-           .order("due_at", desc=False)
-           .limit(limit)
-           .execute())
-    return res.data or []
+    def resolve_alias(self, owner_id: str, alias: str) -> str | None:
+        r = self.sb.table("saturday_contacts").select("contact_id").eq("owner_id", owner_id).eq("alias", alias).limit(1).execute()
+        return (r.data[0]["contact_id"] if r.data else None)
 
-def mark_task_sent(task_id: str):
-    sb = get_supabase()
-    upd = sb.table("saturday_tasks").update({"status": "sent", "sent_at": _now().isoformat()}).eq("id", task_id).execute()
-    return upd.data[0] if upd.data else None
+    # ---------- memories ----------
+    def add_memory(self, owner_id: str, subject_id: str, scope: str, content: str):
+        scope = scope.lower().strip()
+        if scope not in ("private", "shared"):
+            scope = "private"
+        self.sb.table("saturday_memories").insert({
+            "owner_id": owner_id,
+            "subject_id": subject_id,
+            "scope": scope,
+            "content": content
+        }).execute()
 
-def morning_already_sent(owner_user_id: str, run_date: str) -> bool:
-    sb = get_supabase()
-    res = (sb.table("saturday_runs")
-           .select("*")
-           .eq("owner_user_id", owner_user_id)
-           .eq("run_date", run_date)
-           .eq("run_type", "morning")
-           .execute())
-    return bool(res.data)
+    def list_memories(self, owner_id: str, subject_id: str, scopes: list[str], limit: int = 30):
+        q = self.sb.table("saturday_memories").select("id,scope,content,created_at").eq("owner_id", owner_id).eq("subject_id", subject_id)
+        # supabase python doesn't have in_ always stable; do manual filter
+        r = q.order("id", desc=True).limit(limit).execute()
+        data = r.data or []
+        scopes_set = set([s.lower() for s in scopes])
+        return [x for x in data if x.get("scope") in scopes_set]
 
-def mark_morning_sent(owner_user_id: str, run_date: str):
-    sb = get_supabase()
-    sb.table("saturday_runs").insert({
-        "owner_user_id": owner_user_id,
-        "run_date": run_date,
-        "run_type": "morning"
-    }).execute()
+    # ---------- tasks ----------
+    def add_task(self, owner_id: str, subject_id: str, due_at_iso: str, text: str):
+        self.sb.table("saturday_tasks").insert({
+            "owner_id": owner_id,
+            "subject_id": subject_id,
+            "due_at": due_at_iso,
+            "text": text,
+            "status": "pending"
+        }).execute()
+
+    def list_tasks(self, owner_id: str, subject_id: str, status: str = "pending", limit: int = 20):
+        r = (self.sb.table("saturday_tasks")
+             .select("id,due_at,text,status")
+             .eq("owner_id", owner_id)
+             .eq("subject_id", subject_id)
+             .eq("status", status)
+             .order("due_at", desc=False)
+             .limit(limit)
+             .execute())
+        return r.data or []
+
+    def cancel_task(self, owner_id: str, subject_id: str, task_id: str):
+        self.sb.table("saturday_tasks").update({"status": "cancelled"}).eq("owner_id", owner_id).eq("subject_id", subject_id).eq("id", task_id).execute()
+
+    def due_tasks(self, now_iso: str):
+        # get pending tasks due <= now
+        r = (self.sb.table("saturday_tasks")
+             .select("id,owner_id,subject_id,due_at,text")
+             .eq("status", "pending")
+             .lte("due_at", now_iso)
+             .order("due_at", desc=False)
+             .limit(50)
+             .execute())
+        return r.data or []
+
+    def mark_task_sent(self, task_id: str):
+        self.sb.table("saturday_tasks").update({"status": "sent"}).eq("id", task_id).execute()
