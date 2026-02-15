@@ -1,86 +1,41 @@
 import os
+from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
+def env(name: str, default: str = "") -> str:
+    return (os.environ.get(name, default) or "").strip()
 
-def _env(*keys: str, default: str = "") -> str:
-    for k in keys:
-        v = os.environ.get(k)
-        if v and str(v).strip():
-            return str(v).strip()
-    return default
+@dataclass(frozen=True)
+class Config:
+    # LINE
+    LINE_CHANNEL_ACCESS_TOKEN: str = env("LINE_CHANNEL_ACCESS_TOKEN")
+    LINE_CHANNEL_SECRET: str = env("LINE_CHANNEL_SECRET")
 
+    # SUPABASE
+    SUPABASE_URL: str = env("SUPABASE_URL")
+    SUPABASE_SERVICE_ROLE_KEY: str = env("SUPABASE_SERVICE_ROLE_KEY")  # 務必用 service_role
 
-class _CFG:
-    # === 基本 ===
-    TZ = _env("TZ", default="Asia/Taipei")
+    # GEMINI
+    GEMINI_API_KEY: str = env("GEMINI_API_KEY")
 
-    # === LINE ===
-    LINE_CHANNEL_ACCESS_TOKEN = _env("LINE_CHANNEL_ACCESS_TOKEN")
-    LINE_CHANNEL_SECRET = _env("LINE_CHANNEL_SECRET")
+    # SEARCH / WEATHER
+    SERPER_API_KEY: str = env("SERPER_API_KEY")
+    WEATHERAPI_KEY: str = env("WEATHERAPI_KEY")
 
-    # === Gemini ===
-    # 兼容你之前用的 GOOGLE_API_KEY
-    GEMINI_API_KEY = _env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    # REGION
+    TZ_NAME: str = env("TZ", "Asia/Taipei")
+    SERPER_HL: str = env("SERPER_HL", "zh-tw")  # 介面語系
+    SERPER_GL: str = env("SERPER_GL", "tw")     # 地區
 
-    # === Supabase ===
-    SUPABASE_URL = _env("SUPABASE_URL")
-    # 建議用 Service Role Key（伺服器端才安全/穩）
-    SUPABASE_SERVICE_ROLE_KEY = _env("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY")
+    # Tick (UptimeRobot)
+    TICK_SECRET: str = env("TICK_SECRET")
 
-    # === Serper / WeatherAPI ===
-    SERPER_API_KEY = _env("SERPER_API_KEY")
-    WEATHERAPI_KEY = _env("WEATHERAPI_KEY")
+    # Optional: 固定你自己的 OA 主人/夫人（你要 multi 也能留空）
+    DEFAULT_OWNER_ID: str = env("DEFAULT_OWNER_ID")  # 你的 Flynn ID 可放這
+    DEFAULT_WIFE_ID: str = env("DEFAULT_WIFE_ID")    # 你的夫人 ID 可放這
 
-    # === 你要求保留的預設 ID（可用 env 覆蓋）===
-    MY_ID = "U7388690eb33a4e528e78cae4df00d0c2"
-    WIFE_ID = "U0feb2afe319cc8a66ab89ad9fe6ab0fe"
-    DEFAULT_OWNER_ID = _env("OWNER_ID", default=MY_ID)
-    DEFAULT_WIFE_ID = _env("WIFE_ID", default=WIFE_ID)
+    @property
+    def TZ(self) -> ZoneInfo:
+        return ZoneInfo(self.TZ_NAME)
 
-    # === /help 指令表（給你與客人用）===
-    HELP_TEXT = """【Saturday 指令表（V7.1）】
-
-一、查詢自己的 ID
-- 我的ID
-- 查詢我的ID
-
-二、基本設定
-- 設定城市 台中
-- 設定星座 獅子座
-- 設定晨報時間 07:00
-- 開啟晨報
-- 關閉晨報
-
-三、家人/成員綁定（主要使用者 owner）
-- 綁定 夫人 Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-- 解除綁定 夫人
-- 我的綁定
-
-四、稱呼自訂（每個人可不同）
-- 我稱呼 夫人 為 媽媽
-- 我稱呼 先生 為 老公
-
-五、記憶（長期）
-- 記住 我早上習慣喝冰美式
-- 記住(共享) 我早上習慣喝冰美式
-- 我記得什麼
-
-六、提醒（自然語句也可）
-- 兩分鐘後提醒 喝水
-- 1分鐘後提醒夫人 記得買晚餐
-- 2026-02-14 18:30 提醒 帶尿布
-- 我的提醒
-- 取消提醒 <任務ID>
-
-七、資訊
-- 今天日期
-- 今天天氣
-- 明天台中天氣
-- 3天台中天氣
-- 今日運勢
-- 全球新聞
-- 晨報
-- 看新聞 3
-
-備註：本版本以「私聊 1對1」為主，群組建議之後再開。"""
-
-CFG = _CFG()
+CFG = Config()
