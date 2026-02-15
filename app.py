@@ -1,406 +1,405 @@
-import os
-from flask import Flask, request, abort
+import json
+from datetime import datetime
+from flask import Flask, request, abort, jsonify
+
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi,
-    ReplyMessageRequest, TextMessage, PushMessageRequest
-)
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 from config import CFG
-from nlp import detect_intent
-from prompts import build_chat_prompt, build_tool_prompt
-from scheduler import start_scheduler
+from line_client import LineClient
 from supa import Supa
 from tools import Tools, RateLimitError
-
+from utils import (
+    parse_reminder_text,
+    parse_weather_query,
+    parse_news_days,
+    is_date_time_query,
+    is_help_query,
+    is_morning_report_query,
+    is_horoscope_query,
+    is_news_query,
+    is_memory_save_query,
+    extract_memory_scope_and_text,
+    is_memory_list_query,
+    is_send_message_query,
+    parse_send_message,
+    is_setting_city_query,
+    parse_setting_city,
+    is_setting_zodiac_query,
+    parse_setting_zodiac,
+    is_setting_morning_time_query,
+    parse_setting_morning_time,
+    is_bind_query,
+    parse_bind,
+    is_unbind_query,
+    parse_unbind,
+    is_my_bindings_query,
+    is_nickname_query,
+    parse_nickname,
+    safe_user_text,
+)
 
 app = Flask(__name__)
 
-# LINE
-configuration = Configuration(access_token=CFG.LINE_CHANNEL_ACCESS_TOKEN)
+line = LineClient(CFG.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CFG.LINE_CHANNEL_SECRET)
 
-# Supabase + Tools
-supa = Supa(CFG.SUPABASE_URL, CFG.SUPABASE_SERVICE_ROLE_KEY)
-tools = Tools(
-    gemini_api_key=CFG.GEMINI_API_KEY,
-    serper_api_key=CFG.SERPER_API_KEY,
-    weatherapi_key=CFG.WEATHERAPI_KEY,
-    tz_name=CFG.TZ
-)
+SUPA_BOOT_ERROR = None
+GEMINI_BOOT_ERROR = None
 
+supa = None
+tools = None
 
-def reply_text(reply_token: str, text: str):
-    # LINE 單則訊息過長會被截斷/失敗，保守切段
-    chunks = []
-    text = text.strip()
-    while len(text) > 4500:
-        cut = text[:4500]
-        chunks.append(cut)
-        text = text[4500:]
-    chunks.append(text)
+try:
+    supa = Supa(CFG.SUPABASE_URL, CFG.SUPABASE_SERVICE_ROLE_KEY)
+except Exception as e:
+    SUPA_BOOT_ERROR = str(e)
 
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=c) for c in chunks if c.strip()]
-            )
-        )
-
-
-def push_text(to_user_id: str, text: str):
-    # Push 失敗時要能抓到錯誤（未加好友/封鎖/權限）
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        api.push_message(
-            PushMessageRequest(
-                to=to_user_id,
-                messages=[TextMessage(text=text.strip()[:5000])]
-            )
-        )
+try:
+    tools = Tools(
+        gemini_api_key=CFG.GEMINI_API_KEY,
+        serper_api_key=CFG.SERPER_API_KEY,
+        weatherapi_key=CFG.WEATHERAPI_KEY,
+        tz=CFG.TZ,
+        news_hl=CFG.SERPER_HL,
+        news_gl=CFG.SERPER_GL,
+    )
+except Exception as e:
+    GEMINI_BOOT_ERROR = str(e)
 
 
 @app.get("/health")
 def health():
-    return "ok", 200
+    ok = True
+    issues = []
+    if SUPA_BOOT_ERROR:
+        ok = False
+        issues.append(f"SUPABASE: {SUPA_BOOT_ERROR}")
+    if GEMINI_BOOT_ERROR:
+        ok = False
+        issues.append(f"GEMINI: {GEMINI_BOOT_ERROR}")
+    if not CFG.LINE_CHANNEL_ACCESS_TOKEN or not CFG.LINE_CHANNEL_SECRET:
+        ok = False
+        issues.append("LINE env missing")
+
+    return jsonify(
+        {
+            "ok": ok,
+            "time": datetime.now(CFG.TZ).isoformat(timespec="seconds"),
+            "issues": issues,
+            "version": "Saturday V7.2",
+        }
+    ), (200 if ok else 500)
 
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature", "")
+    signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
+
+    if not signature:
+        abort(400)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+    except Exception as e:
+        # webhook 不能 500，否則 LINE 會一直重送 / 使用者覺得完全沒回
+        print(f"[callback] handler crashed: {e}")
+        return "OK"
     return "OK"
+
+
+@app.route("/tick", methods=["GET", "POST"])
+def tick():
+    # 用 UptimeRobot 每分鐘打一發：/tick?k=你的密鑰
+    k = request.args.get("k", "").strip()
+    if not CFG.TICK_SECRET or k != CFG.TICK_SECRET:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
+    if not supa:
+        return jsonify({"ok": False, "error": f"supabase down: {SUPA_BOOT_ERROR}"}), 200
+
+    now = datetime.now(CFG.TZ)
+    out = {"ok": True, "now": now.isoformat(timespec="seconds"), "sent": 0, "morning": 0, "errors": []}
+
+    # 1) 到點提醒
+    try:
+        due = supa.fetch_due_reminders(now)
+        for r in due[:20]:
+            try:
+                text = f"⏰ 提醒：{r['message']}\n（建立者：{supa.label_of(r['created_by'], r['tenant_id'])}）"
+                line.push_text(r["target_user_id"], text)
+                supa.mark_reminder_sent(r["id"], now)
+                out["sent"] += 1
+            except Exception as e:
+                out["errors"].append(f"reminder:{r.get('id')}:{e}")
+    except Exception as e:
+        out["errors"].append(f"fetch_due:{e}")
+
+    # 2) 晨報（每位使用者每天一次）
+    try:
+        hhmm = now.strftime("%H:%M")
+        today = now.date().isoformat()
+        targets = supa.list_morning_targets(hhmm, today)  # RPC
+        for p in targets[:8]:  # 防止一次送太多人拖慢
+            user_id = p["user_id"]
+            tenant_id = p["tenant_id"]
+            try:
+                ctx = supa.get_context(user_id, CFG.DEFAULT_OWNER_ID, CFG.DEFAULT_WIFE_ID)
+                prefs = supa.get_user_prefs(user_id, tenant_id)
+                report = tools.build_morning_report(ctx=ctx, prefs=prefs, now=now)
+                line.push_text(user_id, report)
+                supa.set_last_morning_sent(user_id, tenant_id, today)
+                out["morning"] += 1
+            except RateLimitError as e:
+                # 搜尋額度用完：要提示
+                line.push_text(user_id, f"☀️ 晨報：搜尋額度已達上限（免費方案常見）。\n細節：{e}")
+                supa.set_last_morning_sent(user_id, tenant_id, today)
+                out["morning"] += 1
+            except Exception as e:
+                out["errors"].append(f"morning:{user_id}:{e}")
+    except Exception as e:
+        out["errors"].append(f"list_morning_targets:{e}")
+
+    return jsonify(out), 200
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id
-    text = (event.message.text or "").strip()
+    text = safe_user_text(event.message.text)
+
     if not text:
         return
 
-    # 解析租戶/角色/稱呼（多成員 & 每人不同稱呼）
-    ctx = supa.get_context(user_id, default_owner_id=CFG.DEFAULT_OWNER_ID, default_wife_id=CFG.DEFAULT_WIFE_ID)
-    tenant_id = ctx["tenant_id"]
-    profile = ctx["profile"]
-    address_me = profile.get("address_me") or ctx["default_address_me"]
-    speaker_label = ctx["speaker_label"]  # 用於 prompt：先生/夫人/成員名
-
-    # 指令/自然語句意圖
-    intent = detect_intent(text, tz_name=CFG.TZ)
-
+    # 任何錯都不能讓 webhook 500
     try:
-        # 0) /help
-        if intent.name == "HELP":
-            reply_text(event.reply_token, CFG.HELP_TEXT)
+        if not supa:
+            line.reply_text(event.reply_token, f"先生/女士，記憶庫連線失敗：{SUPA_BOOT_ERROR}")
+            return
+        if not tools:
+            line.reply_text(event.reply_token, f"先生/女士，大腦（Gemini）連線失敗：{GEMINI_BOOT_ERROR}")
             return
 
-        # 1) 查自己的 ID（方便主要使用者綁定）
-        if intent.name == "MY_ID":
-            reply_text(event.reply_token, f"你的 LINE userId：\n{user_id}")
+        ctx = supa.get_context(user_id, CFG.DEFAULT_OWNER_ID, CFG.DEFAULT_WIFE_ID)
+        tenant_id = ctx["tenant_id"]
+        honorific = ctx["honorific"]
+
+        # ===== 1) help =====
+        if is_help_query(text):
+            line.reply_text(event.reply_token, tools.help_text())
             return
 
-        # 2) 綁定/解除綁定/看綁定
-        if intent.name == "BIND":
-            # 只有 owner 可以綁定（避免亂綁）
-            if profile.get("role") != "owner":
-                reply_text(event.reply_token, f"{address_me}，只有主要使用者（owner）可以執行綁定。")
+        # ===== 2) 綁定/解除 =====
+        if is_bind_query(text) and ctx["role"] in ("owner",):
+            label, target_id = parse_bind(text)
+            supa.bind_member(tenant_id, label, target_id, added_by=user_id)
+            line.reply_text(event.reply_token, f"好的，{honorific}。已綁定「{label}」✅")
+            return
+
+        if is_unbind_query(text) and ctx["role"] in ("owner",):
+            label = parse_unbind(text)
+            ok = supa.unbind_member(tenant_id, label)
+            line.reply_text(event.reply_token, f"好的，{honorific}。已解除「{label}」✅" if ok else f"找不到「{label}」的綁定。")
+            return
+
+        if is_my_bindings_query(text):
+            s = supa.list_members_text(tenant_id, viewer_id=user_id)
+            line.reply_text(event.reply_token, s)
+            return
+
+        # ===== 3) 暱稱（每個人自己定義怎麼叫別人）=====
+        if is_nickname_query(text):
+            target_name, nickname = parse_nickname(text)
+            target_id = supa.resolve_target_user_id(tenant_id, viewer_id=user_id, name=target_name)
+            if not target_id:
+                line.reply_text(event.reply_token, f"我找不到「{target_name}」是誰。你可以先用「綁定」或改用對方的 user_id。")
                 return
-            ok, msg = supa.bind_contact(
-                tenant_id=tenant_id,
-                canonical_name=intent.args["name"],
-                line_user_id=intent.args["user_id"]
-            )
-            reply_text(event.reply_token, msg)
+            supa.set_nickname(tenant_id, viewer_id=user_id, target_user_id=target_id, nickname=nickname)
+            line.reply_text(event.reply_token, f"好的，{honorific}。以後你提到「{nickname}」我就知道是他/她。")
             return
 
-        if intent.name == "UNBIND":
-            if profile.get("role") != "owner":
-                reply_text(event.reply_token, f"{address_me}，只有主要使用者（owner）可以解除綁定。")
+        # ===== 4) 設定：城市 / 星座 / 晨報時間 =====
+        if is_setting_city_query(text):
+            city = parse_setting_city(text)
+            supa.set_city(user_id, tenant_id, city)
+            line.reply_text(event.reply_token, f"好的，{honorific}。已設定城市為「{city}」。")
+            return
+
+        if is_setting_zodiac_query(text):
+            zodiac = parse_setting_zodiac(text)
+            supa.set_zodiac(user_id, tenant_id, zodiac)
+            line.reply_text(event.reply_token, f"好的，{honorific}。已設定星座為「{zodiac}」。")
+            return
+
+        if is_setting_morning_time_query(text):
+            hhmm = parse_setting_morning_time(text)
+            supa.set_morning_time(user_id, tenant_id, hhmm)
+            line.reply_text(event.reply_token, f"好的，{honorific}。晨報時間已設定為 {hhmm}。")
+            return
+
+        # ===== 5) 傳訊 =====
+        if is_send_message_query(text):
+            target_name, msg = parse_send_message(text)
+            target_id = supa.resolve_target_user_id(tenant_id, viewer_id=user_id, name=target_name)
+            if not target_id:
+                line.reply_text(event.reply_token, f"我找不到「{target_name}」是誰。先用「綁定」或讓對方先跟我說句話。")
                 return
-            msg = supa.unbind_contact(tenant_id=tenant_id, canonical_name=intent.args["name"])
-            reply_text(event.reply_token, msg)
-            return
 
-        if intent.name == "LIST_BINDINGS":
-            txt = supa.list_bindings_text(tenant_id=tenant_id, viewer_user_id=user_id)
-            reply_text(event.reply_token, txt)
-            return
-
-        # 3) 個人化稱呼：我稱呼 <對象> 為 <新稱呼>
-        if intent.name == "SET_NICKNAME":
-            msg = supa.set_nickname(
-                tenant_id=tenant_id,
-                viewer_user_id=user_id,
-                target_name=intent.args["target_name"],
-                nickname=intent.args["nickname"]
-            )
-            reply_text(event.reply_token, msg)
-            return
-
-        # 4) 設定：城市/星座/晨報時間/晨報開關
-        if intent.name == "SET_CITY":
-            supa.set_profile(tenant_id, user_id, {"home_city": intent.args["city"]})
-            reply_text(event.reply_token, f"好的，{address_me}，已設定城市為「{intent.args['city']}」。")
-            return
-
-        if intent.name == "SET_ZODIAC":
-            supa.set_profile(tenant_id, user_id, {"zodiac_sign": intent.args["sign"]})
-            reply_text(event.reply_token, f"好的，{address_me}，已設定星座為「{intent.args['sign']}」。")
-            return
-
-        if intent.name == "SET_MORNING_TIME":
-            supa.set_profile(tenant_id, user_id, {"morning_time": intent.args["time"], "morning_enabled": True})
-            reply_text(event.reply_token, f"好的，{address_me}，晨報時間已設為 {intent.args['time']}（已開啟）。")
-            return
-
-        if intent.name == "MORNING_ON":
-            supa.set_profile(tenant_id, user_id, {"morning_enabled": True})
-            reply_text(event.reply_token, f"好的，{address_me}，晨報已開啟。")
-            return
-
-        if intent.name == "MORNING_OFF":
-            supa.set_profile(tenant_id, user_id, {"morning_enabled": False})
-            reply_text(event.reply_token, f"好的，{address_me}，晨報已關閉。")
-            return
-
-        # 5) 傳訊：傳訊給<稱呼> <內容>
-        if intent.name == "SEND_MESSAGE":
-            target_user_id, target_display = supa.resolve_target_user(tenant_id, viewer_user_id=user_id, target_text=intent.args["target"])
-            if not target_user_id:
-                reply_text(event.reply_token, f"{address_me}，我找不到「{intent.args['target']}」。你可以先用「我的綁定」確認。")
+            # 互傳允許：同 tenant 成員之間都可以
+            if not supa.is_member(tenant_id, user_id) or not supa.is_member(tenant_id, target_id):
+                line.reply_text(event.reply_token, "目前你或對方不在同一個成員清單內，無法轉告。")
                 return
-            # 使用收件人視角稱呼發訊者
-            sender_label_for_receiver = supa.get_sender_label_for_receiver(tenant_id, sender_user_id=user_id, receiver_user_id=target_user_id)
-            try:
-                push_text(target_user_id, f"📩 轉告（來自 {sender_label_for_receiver}）：\n{intent.args['message']}")
-                reply_text(event.reply_token, f"好的，{address_me}，已替你轉告給「{target_display}」。")
-            except Exception as e:
-                reply_text(event.reply_token, f"{address_me}，我嘗試推播但失敗了（對方可能未加好友/封鎖/權限不足）。\n錯誤：{str(e)[:200]}")
+
+            from_label = supa.label_of(user_id, tenant_id)
+            to_label = supa.label_of(target_id, tenant_id, viewer_id=target_id)
+            line.push_text(target_id, f"📩 轉告（來自 {from_label}）：\n{msg}")
+            line.reply_text(event.reply_token, f"好的，{honorific}。我已轉告給「{to_label}」。")
             return
 
-        # 6) 提醒：自然語句（兩分鐘後提醒… / 2026-02-14 18:30 提醒… / 提醒夫人…）
-        if intent.name == "REMIND":
-            target = intent.args.get("target")  # 可能是 None
-            to_user_id = user_id
-            to_display = address_me
-
-            if target:
-                resolved_id, resolved_name = supa.resolve_target_user(tenant_id, viewer_user_id=user_id, target_text=target)
-                if not resolved_id:
-                    reply_text(event.reply_token, f"{address_me}，我找不到「{target}」。你可以先用「我的綁定」確認。")
+        # ===== 6) 提醒 =====
+        r = parse_reminder_text(text, now=datetime.now(CFG.TZ))
+        if r:
+            # target 可用「提醒夫人...」這種寫法；沒寫就提醒自己
+            target_id = None
+            if r.get("target_name"):
+                target_id = supa.resolve_target_user_id(tenant_id, viewer_id=user_id, name=r["target_name"])
+                if not target_id:
+                    line.reply_text(event.reply_token, f"我找不到「{r['target_name']}」是誰。")
                     return
-                to_user_id, to_display = resolved_id, resolved_name
+            else:
+                target_id = user_id
 
-            reminder_id = supa.create_reminder(
+            if not supa.is_member(tenant_id, user_id):
+                # 第一次說話的人，先視為 owner/member
+                supa.ensure_member(tenant_id, user_id)
+
+            rid = supa.create_reminder(
                 tenant_id=tenant_id,
                 created_by=user_id,
-                to_user_id=to_user_id,
-                title=intent.args["title"],
-                due_at=intent.args["due_at"]
+                target_user_id=target_id,
+                due_at=r["due_at"],
+                message=r["message"],
             )
-            reply_text(event.reply_token, f"好的，{address_me}。\n✅ 已建立提醒（ID: {reminder_id}）\n對象：{to_display}\n時間：{intent.args['due_at']}\n內容：{intent.args['title']}")
+            to_label = supa.label_of(target_id, tenant_id, viewer_id=target_id)
+            line.reply_text(
+                event.reply_token,
+                f"好的，{honorific}。我會在 {r['due_at_str']} 提醒「{to_label}」：{r['message']}\n任務ID：{rid}",
+            )
             return
 
-        if intent.name == "LIST_REMINDERS":
-            txt = supa.list_reminders_text(tenant_id=tenant_id, user_id=user_id)
-            reply_text(event.reply_token, txt)
-            return
-
-        if intent.name == "CANCEL_REMINDER":
-            msg = supa.cancel_reminder(tenant_id=tenant_id, user_id=user_id, reminder_id=intent.args["id"])
-            reply_text(event.reply_token, msg)
-            return
-
-        # 7) 記憶：記住 / 記住(共享)
-        if intent.name == "REMEMBER":
-            scope = intent.args["scope"]  # private/shared
-            content = intent.args["content"].strip()
-
-            # 共享記憶：首次確認一次（不每次都問）
-            if scope == "shared" and not profile.get("share_confirmed"):
-                pending_id = supa.create_pending_share(tenant_id, user_id, content)
-                reply_text(
-                    event.reply_token,
-                    f"{address_me}，你要把這條記憶設為【家庭共享】嗎？（只問這一次）\n\n"
-                    f"內容：{content}\n\n"
-                    f"回覆其一：\n"
-                    f"1) 共享\n"
-                    f"2) 私密\n"
-                    f"（待確認ID: {pending_id}）"
-                )
+        # ===== 7) 日期時間 =====
+        if is_date_time_query(text):
+            now = datetime.now(CFG.TZ)
+            if "比特幣" in text or "BTC" in text.upper() or "台積電" in text or "TSMC" in text.upper():
+                # 這類走新聞/搜尋（避免亂報）
+                try:
+                    ans = tools.answer_market_quick(text, now=now)
+                    line.reply_text(event.reply_token, ans)
+                except RateLimitError as e:
+                    line.reply_text(event.reply_token, f"搜尋額度已達上限（免費方案常見）。\n{e}")
                 return
 
-            # 寫入長期記憶（explicit 記住一定寫）
-            supa.save_long_memory(tenant_id, user_id, content, scope=scope, embed_fn=tools.embed)
-            reply_text(event.reply_token, f"好的，{address_me}，已記住（{ '家庭共享' if scope=='shared' else '僅你可用' }）。")
+            line.reply_text(event.reply_token, f"台灣時間：{now.strftime('%Y-%m-%d %H:%M:%S')}（{CFG.TZ.key}）")
             return
 
-        # 8) 共享確認：共享 / 私密
-        if intent.name == "CONFIRM_SHARE":
-            ok, msg = supa.confirm_pending_share(tenant_id, user_id, decision=intent.args["decision"], embed_fn=tools.embed)
-            if ok and intent.args["decision"] == "shared":
-                supa.set_profile(tenant_id, user_id, {"share_confirmed": True})
-            reply_text(event.reply_token, msg)
-            return
-
-        # 9) 我記得什麼（列出長期記憶）
-        if intent.name == "LIST_MEMORY":
-            txt = supa.list_long_memories_text(tenant_id=tenant_id, requester_id=user_id)
-            reply_text(event.reply_token, txt)
-            return
-
-        # 10) 查詢型工具：日期/天氣/預報/運勢/新聞/晨報
-        tool_payload = None
-
-        if intent.name == "DATE_NOW":
-            now_str = tools.now_text()
-            reply_text(event.reply_token, now_str)
-            return
-
-        if intent.name == "WEATHER_NOW":
-            city = intent.args.get("city") or profile.get("home_city")
-            if not city:
-                reply_text(event.reply_token, f"{address_me}，你還沒設定城市。先說「設定城市 台中」即可。")
-                return
-            w = tools.weather_now(city)
-            reply_text(event.reply_token, tools.format_weather_now(city, w))
-            return
-
-        if intent.name == "WEATHER_FORECAST":
-            city = intent.args.get("city") or profile.get("home_city")
-            days = intent.args.get("days", 3)
-            if not city:
-                reply_text(event.reply_token, f"{address_me}，你還沒設定城市。先說「設定城市 台中」即可。")
-                return
-            f = tools.weather_forecast(city, days=days)
-            reply_text(event.reply_token, tools.format_weather_forecast(city, f, days=days))
-            return
-
-        if intent.name == "HOROSCOPE_TODAY":
-            sign = profile.get("zodiac_sign")
-            if not sign:
-                reply_text(event.reply_token, f"{address_me}，你還沒設定星座。先說「設定星座 獅子座」即可。")
+        # ===== 8) 天氣 =====
+        if "天氣" in text:
+            prefs = supa.get_user_prefs(user_id, tenant_id)
+            wq = parse_weather_query(text, default_city=prefs.get("city") or "")
+            if not wq.get("city"):
+                line.reply_text(event.reply_token, f"好的，{honorific}。你要查哪個城市的天氣？（例如：台中、台北）")
                 return
             try:
-                h = tools.horoscope_today(sign)
-                reply_text(event.reply_token, tools.format_horoscope(sign, h))
+                ans = tools.answer_weather(wq, now=datetime.now(CFG.TZ))
+                line.reply_text(event.reply_token, ans)
             except RateLimitError as e:
-                reply_text(event.reply_token, f"{address_me}，運勢搜尋遇到額度/限流：{e}")
+                line.reply_text(event.reply_token, f"（天氣服務或搜尋額度已達上限）\n{e}")
             return
 
-        if intent.name == "NEWS":
+        # ===== 9) 運勢 =====
+        if is_horoscope_query(text):
+            prefs = supa.get_user_prefs(user_id, tenant_id)
+            zodiac = prefs.get("zodiac") or ""
+            if not zodiac:
+                line.reply_text(event.reply_token, f"好的，{honorific}。你還沒設定星座，輸入：設定星座 獅子座")
+                return
             try:
-                items = tools.news(
-                    query=intent.args.get("query") or "全球重大新聞",
-                    days=intent.args.get("days", 7),
-                    limit=intent.args.get("limit", 8)
-                )
-                reply_text(event.reply_token, tools.format_news(items, ask_detail=True))
+                ans = tools.answer_horoscope(zodiac=zodiac, now=datetime.now(CFG.TZ))
+                line.reply_text(event.reply_token, ans)
             except RateLimitError as e:
-                reply_text(event.reply_token, f"{address_me}，新聞搜尋遇到額度/限流：{e}")
+                line.reply_text(event.reply_token, f"搜尋額度已達上限（免費方案常見）。\n{e}")
             return
 
-        if intent.name == "NEWS_DETAIL":
+        # ===== 10) 新聞 =====
+        if is_news_query(text):
             try:
-                idx = intent.args["index"]
-                last = supa.get_last_news_cache(tenant_id, user_id)
-                if not last or idx < 1 or idx > len(last):
-                    reply_text(event.reply_token, f"{address_me}，我找不到那則新聞。你可以先說「全球新聞」。")
-                    return
-                item = last[idx - 1]
-                reply_text(event.reply_token, tools.format_news_detail(item))
-            except Exception as e:
-                reply_text(event.reply_token, f"{address_me}，取得新聞詳細失敗：{str(e)[:200]}")
-            return
-
-        if intent.name == "MORNING_NOW":
-            # 立刻生成晨報（不等排程）
-            city = profile.get("home_city") or "（未設定）"
-            sign = profile.get("zodiac_sign") or "（未設定）"
-            try:
-                morning = tools.build_morning_brief(city=city, zodiac=sign, news_days=7, news_limit=8)
-                # 把新聞 cache 起來讓「看新聞 3」可用
-                if morning.get("news_items"):
-                    supa.set_last_news_cache(tenant_id, user_id, morning["news_items"])
-                # 節日提示
-                holiday_line = tools.today_holiday_line()
-                text_out = tools.format_morning(morning, holiday_line=holiday_line)
-                reply_text(event.reply_token, text_out)
+                days = parse_news_days(text)  # 今日/近7日/近3日...
+                ans = tools.answer_news(days=days, now=datetime.now(CFG.TZ), session_user_id=user_id)
+                line.reply_text(event.reply_token, ans)
             except RateLimitError as e:
-                reply_text(event.reply_token, f"{address_me}，晨報搜尋遇到額度/限流：{e}")
+                line.reply_text(event.reply_token, f"搜尋額度已達上限（免費方案常見）。\n{e}")
             return
 
-        # 11) 一般聊天（像管家）：帶短期記憶 + 長期向量聯想（私密/共享隔離）
-        # 短期記憶
-        short_mem = supa.load_short_memory(tenant_id=tenant_id, user_id=user_id, limit=6)
-        # 長期記憶（向量搜尋）
-        long_mem = supa.search_long_memory(
-            tenant_id=tenant_id,
-            requester_id=user_id,
-            query=text,
-            embed_fn=tools.embed,
-            match_threshold=0.25,
-            match_count=5
+        # ===== 11) 晨報（手動）=====
+        if is_morning_report_query(text):
+            prefs = supa.get_user_prefs(user_id, tenant_id)
+            try:
+                report = tools.build_morning_report(ctx=ctx, prefs=prefs, now=datetime.now(CFG.TZ))
+                line.reply_text(event.reply_token, report)
+            except RateLimitError as e:
+                line.reply_text(event.reply_token, f"☀️ 晨報：搜尋額度已達上限（免費方案常見）。\n{e}")
+            return
+
+        # ===== 12) 記憶：存 =====
+        if is_memory_save_query(text):
+            scope, mem = extract_memory_scope_and_text(text)
+            if not mem:
+                line.reply_text(event.reply_token, f"好的，{honorific}。你要我記住什麼？例如：記住 我早上愛喝冰美式")
+                return
+            supa.save_memory(tenant_id=tenant_id, user_id=user_id, scope=scope, content=mem)
+            line.reply_text(event.reply_token, f"好的，{honorific}。已記住（{'共享' if scope=='shared' else '僅你可用'}）。")
+            return
+
+        # ===== 13) 記憶：列出 =====
+        if is_memory_list_query(text):
+            mems = supa.list_recent_memories(tenant_id=tenant_id, user_id=user_id, limit=20)
+            if not mems:
+                line.reply_text(event.reply_token, f"好的，{honorific}。目前沒有可用記憶。你可以用「記住 ...」建立。")
+                return
+            out = [f"【我記得的事（最多20筆）】"]
+            for m in mems:
+                tag = "共享" if m["scope"] == "shared" else "私密"
+                out.append(f"- ({tag}) {m['content']}")
+            line.reply_text(event.reply_token, "\n".join(out))
+            return
+
+        # ===== 14) 一般聊天（用 LLM + 記憶檢索）=====
+        # 短期：最近 6 回合
+        turns = supa.load_recent_turns(tenant_id=tenant_id, user_id=user_id, limit=6)
+
+        # 長期：FTS/相似度檢索（共享+私密）
+        memories = supa.search_memories(tenant_id=tenant_id, user_id=user_id, query=text, limit=8)
+
+        reply = tools.chat(
+            ctx=ctx,
+            text=text,
+            now=datetime.now(CFG.TZ),
+            turns=turns,
+            memories=memories,
         )
 
-        prompt = build_chat_prompt(
-            tz_name=CFG.TZ,
-            address_me=address_me,
-            speaker_label=speaker_label,
-            short_memory=short_mem,
-            long_memory=long_mem,
-            user_text=text
-        )
+        line.reply_text(event.reply_token, reply)
 
-        answer = tools.llm_generate(prompt)
-        reply_text(event.reply_token, answer)
-
-        # 寫短期記憶（每次都寫），並做簡單修剪避免爆表
-        supa.save_short_memory(tenant_id, user_id, text, answer, keep_last=60)
-
-        # 隱性長期記憶（只在像「偏好/習慣/重要資訊」且不涉敏感財務健康時才寫）
-        # 你要的「自然理解」：用規則先篩，再小判斷一次（不會每句都慢）
-        supa.maybe_auto_save_long(
-            tenant_id=tenant_id,
-            user_id=user_id,
-            user_text=text,
-            assistant_text=answer,
-            embed_fn=tools.embed,
-            llm_judge_fn=tools.llm_judge_memory
-        )
+        # 存短期回合（永遠存，供連貫）
+        supa.save_turn(tenant_id=tenant_id, user_id=user_id, role=ctx["role"], user_text=text, bot_text=reply)
 
     except Exception as e:
-        # 任何錯誤都要回覆，避免「沒下文」
-        reply_text(event.reply_token, f"{address_me}，我這邊剛剛出了一點狀況，已記錄。\n錯誤：{str(e)[:300]}")
-
-
-# 啟動排程器（提醒/晨報/節日）
-# 注意：請在 Render 用 workers=1，避免多個 scheduler 重複發送
-_scheduler_started = False
-if not _scheduler_started:
-    try:
-        start_scheduler(
-            tz_name=CFG.TZ,
-            supa=supa,
-            push_fn=push_text,
-            tools=tools
-        )
-        _scheduler_started = True
-    except Exception as _e:
-        # 不讓排程失敗影響 webhook
-        print(f"[scheduler] start failed: {_e}")
-
-
-if __name__ == "__main__":
-    # 本機測試用；Render 請用 gunicorn start command
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+        print(f"[handle_message] crashed: {e}")
+        try:
+            line.reply_text(event.reply_token, "先生/女士，我剛剛出了點狀況，但我還在。你可以再說一次，或輸入 /help。")
+        except Exception:
+            pass
